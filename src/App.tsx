@@ -33,6 +33,7 @@ type Pillar = {
   width?: number;
   length?: number;
   diameter?: number;
+  auto?: boolean;
 };
 type Beam = {
   id: number;
@@ -603,9 +604,11 @@ const [editBeamHeight, setEditBeamHeight] = useState(0.3); // m (valor inicial q
     "livre" | "horizontal" | "vertical"
   >("livre");
 
-  const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
-    "pdf"
-  );
+const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
+  "pdf"
+);
+const [showPillarSection, setShowPillarSection] = useState(true);
+const [showBeamSection, setShowBeamSection] = useState(true);
 
   const isOrtho = viewMode !== "3d";
 
