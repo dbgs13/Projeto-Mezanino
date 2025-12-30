@@ -55,6 +55,11 @@ type BeamSegment = {
   height: number;
 };
 
+type MoveSelection = {
+  start: Point3 | null;
+  current: Point3 | null;
+};
+
 
 type OrthoView = "top" | "bottom" | "front" | "back" | "left" | "right";
 type ViewMode = "3d" | OrthoView;
@@ -67,9 +72,11 @@ const POINT_TO_MM = 25.4 / 72;
 function CameraController({
   viewMode,
   resetToken,
+  allowPan = true,
 }: {
   viewMode: ViewMode;
   resetToken: number;
+  allowPan?: boolean;
 }) {
   const { camera } = useThree();
   const controls = useRef<any>(null);
@@ -139,7 +146,7 @@ function CameraController({
   return (
     <OrbitControls
       ref={controls}
-      enablePan
+      enablePan={allowPan}
       enableZoom
       enableRotate={canRotate}
       mouseButtons={{
@@ -270,10 +277,16 @@ function PdfPlane({
   pdf,
   scaleDenominator,
   onPlaneClick,
+  onPlaneMove,
+  onPlaneUp,
+  capturePointer = false,
 }: {
   pdf: PdfInfo;
   scaleDenominator: number;
-  onPlaneClick?: (p: Point3) => void;
+  onPlaneClick?: (p: Point3, e?: any) => void;
+  onPlaneMove?: (p: Point3, e?: any) => void;
+  onPlaneUp?: () => void;
+  capturePointer?: boolean;
 }) {
   const texture = useLoader(TextureLoader, pdf.textureUrl);
 
@@ -287,13 +300,30 @@ function PdfPlane({
   const heightRealM = heightRealMm / 1000;
 
   const handlePointerDown = (e: any) => {
+    if (capturePointer) e.stopPropagation();
     if (!onPlaneClick) return;
     const p = e.point;
-    onPlaneClick({ x: p.x, y: p.y, z: p.z });
+    onPlaneClick({ x: p.x, y: p.y, z: p.z }, e);
+  };
+
+  const handlePointerMove = (e: any) => {
+    if (capturePointer) e.stopPropagation();
+    if (!onPlaneMove) return;
+    const p = e.point;
+    onPlaneMove({ x: p.x, y: p.y, z: p.z }, e);
+  };
+
+  const handlePointerUp = () => {
+    // pointer up deve impedir o pan do orbit durante drag
+    onPlaneUp && onPlaneUp();
   };
 
   return (
-    <mesh onPointerDown={handlePointerDown}>
+    <mesh
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+    >
       <planeGeometry args={[widthRealM, heightRealM]} />
       <meshBasicMaterial map={texture} />
     </mesh>
@@ -394,10 +424,16 @@ function BeamMesh({
 function PillarMesh({
   pillar,
   onClick,
+  onPointerDown,
+  onPointerUp,
+  onPointerMove,
   isSelected,
 }: {
   pillar: Pillar;
   onClick?: () => void;
+  onPointerDown?: (pillar: Pillar, e: any) => void;
+  onPointerUp?: () => void;
+  onPointerMove?: (p: Point3, e: any) => void;
   isSelected?: boolean;
 }) {
   const { x, y, type, width, length, diameter, height } = pillar;
@@ -417,6 +453,19 @@ function PillarMesh({
           e.stopPropagation();
           onClick && onClick();
         }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          onPointerDown && onPointerDown(pillar, e);
+        }}
+        onPointerMove={(e) => {
+          e.stopPropagation();
+          onPointerMove &&
+            onPointerMove({ x: e.point.x, y: e.point.y, z: e.point.z }, e);
+        }}
+        onPointerUp={(e) => {
+          e.stopPropagation();
+          onPointerUp && onPointerUp();
+        }}
       >
         <boxGeometry args={[w, l, h]} />
         <meshStandardMaterial color={isSelected ? "#ffcc00" : "#ffaa33"} />
@@ -433,6 +482,19 @@ function PillarMesh({
       onClick={(e) => {
         e.stopPropagation();
         onClick && onClick();
+      }}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        onPointerDown && onPointerDown(pillar, e);
+      }}
+      onPointerMove={(e) => {
+        e.stopPropagation();
+        onPointerMove &&
+          onPointerMove({ x: e.point.x, y: e.point.y, z: e.point.z }, e);
+      }}
+      onPointerUp={(e) => {
+        e.stopPropagation();
+        onPointerUp && onPointerUp();
       }}
     >
       <cylinderGeometry args={[radius, radius, h, 32]} />
@@ -483,10 +545,12 @@ function App() {
   // modo polilinha de vigas (perímetro qualquer)
   const [drawPolylineMode, setDrawPolylineMode] = useState(false);
   const [polyPoints, setPolyPoints] = useState<Point3[]>([]);
+  const [drawAxisLock, setDrawAxisLock] = useState<"none" | "x" | "y">("none");
   const finalizePolyline = () => {
     if (polyPoints.length < 2) {
       setPolyPoints([]);
       setDrawPolylineMode(false);
+      cleanupOrphanBeams();
       return;
     }
 
@@ -495,7 +559,7 @@ function App() {
     const dist = Math.hypot(first.x - last.x, first.y - last.y);
 
     if (dist > 1e-6) {
-      addBeamBetween(last, first, false);
+      addBeamBetween(last, first, false, true);
     }
 
     if (polyPoints.length >= 3) {
@@ -504,15 +568,31 @@ function App() {
 
     setPolyPoints([]);
     setDrawPolylineMode(false);
+    cleanupOrphanBeams();
   };
 
-  const [selectedBeamId, setSelectedBeamId] = useState<number | null>(null);
-  const [selectedBeamSegment, setSelectedBeamSegment] = useState<
-    BeamSegment | null
-  >(null);
-  const [selectedPillarId, setSelectedPillarId] = useState<number | null>(null);
-  const [editBeamWidth, setEditBeamWidth] = useState(0.15); // m
-  const [editBeamHeight, setEditBeamHeight] = useState(0.3); // m (valor inicial qualquer)
+const [selectedBeamId, setSelectedBeamId] = useState<number | null>(null);
+const [selectedBeamSegment, setSelectedBeamSegment] = useState<
+  BeamSegment | null
+>(null);
+const [selectedPillarId, setSelectedPillarId] = useState<number | null>(null);
+const [selectedPillarIds, setSelectedPillarIds] = useState<number[]>([]);
+const [moveMode, setMoveMode] = useState(false);
+const [moveSelection, setMoveSelection] = useState<MoveSelection>({
+  start: null,
+  current: null,
+});
+const [moveDx, setMoveDx] = useState(0);
+const [moveDy, setMoveDy] = useState(0);
+const [moveAllowX, setMoveAllowX] = useState(true);
+const [moveAllowY, setMoveAllowY] = useState(true);
+const [isDraggingPillars, setIsDraggingPillars] = useState(false);
+const [dragStartPoint, setDragStartPoint] = useState<Point3 | null>(null);
+const [dragInitialPositions, setDragInitialPositions] = useState<
+  Map<number, { x: number; y: number }>
+>(new Map());
+const [editBeamWidth, setEditBeamWidth] = useState(0.15); // m
+const [editBeamHeight, setEditBeamHeight] = useState(0.3); // m (valor inicial qualquer)
 
 
   const [insertMode, setInsertMode] = useState(false);
@@ -523,7 +603,9 @@ function App() {
     "livre" | "horizontal" | "vertical"
   >("livre");
 
-  const [activePanel, setActivePanel] = useState<"pdf" | "pillars">("pdf");
+  const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
+    "pdf"
+  );
 
   const isOrtho = viewMode !== "3d";
 
@@ -648,6 +730,35 @@ function App() {
     return positions;
   };
 
+  const snapToPillarPoint = (p: Point3) => {
+    const snapTol = 0.4; // 40 cm de raio para snap
+    let best: Pillar | null = null;
+    let bestD = Infinity;
+    pillars.forEach((pl) => {
+      const d = Math.hypot(pl.x - p.x, pl.y - p.y);
+      if (d < snapTol && d < bestD) {
+        best = pl;
+        bestD = d;
+      }
+    });
+    if (!best) return p;
+    return { ...p, x: best.x, y: best.y };
+  };
+
+  const beamHasPillar = (beam: Beam, list: Pillar[] = pillars) => {
+    const tol = 0.05;
+    return list.some(
+      (p) =>
+        Math.hypot(p.x - beam.x1, p.y - beam.y1) <= tol ||
+        Math.hypot(p.x - beam.x2, p.y - beam.y2) <= tol
+    );
+  };
+
+  const cleanupOrphanBeams = (list?: Pillar[]) => {
+    const ref = list ?? pillars;
+    setBeams((prev) => prev.filter((b) => beamHasPillar(b, ref)));
+  };
+
   const isSameSegment = (b: Beam, p1: Point3, p2: Point3) => {
     const tol = 1e-4;
     const match = (x1: number, y1: number, x2: number, y2: number) =>
@@ -660,7 +771,12 @@ function App() {
     return direct || reverse;
   };
 
-  const addBeamBetween = (p1: Point3, p2: Point3, withPillars = true) => {
+  const addBeamBetween = (
+    p1: Point3,
+    p2: Point3,
+    withPillars = true,
+    allowOrphan = false
+  ) => {
     const dx = p2.x - p1.x;
     const dy = p2.y - p1.y;
     const span = Math.sqrt(dx * dx + dy * dy);
@@ -685,12 +801,17 @@ function App() {
 
     setBeams((prev) => {
       if (prev.some((b) => isSameSegment(b, p1, p2))) return prev;
+      if (!allowOrphan && !withPillars && !beamHasPillar(newBeam)) return prev;
       return [...prev, newBeam];
     });
 
     if (withPillars) {
       // 🔹 gera pilares automaticamente ao longo da viga
       generatePillarsForSegment(p1, p2);
+    }
+
+    if (!withPillars && !allowOrphan) {
+      cleanupOrphanBeams();
     }
   };
 
@@ -756,8 +877,13 @@ function App() {
       intersections.sort((a, b) => a - b);
       for (let k = 0; k + 1 < intersections.length; k += 2) {
         const y1 = intersections[k];
-        const y2 = intersections[k + 1];
-        addBeamBetween({ x: x0, y: y1, z: 0 }, { x: x0, y: y2, z: 0 }, false);
+      const y2 = intersections[k + 1];
+      addBeamBetween(
+        { x: x0, y: y1, z: 0 },
+        { x: x0, y: y2, z: 0 },
+        false,
+        true
+      );
       }
     };
 
@@ -779,21 +905,40 @@ function App() {
       intersections.sort((a, b) => a - b);
       for (let k = 0; k + 1 < intersections.length; k += 2) {
         const x1 = intersections[k];
-        const x2 = intersections[k + 1];
-        addBeamBetween({ x: x1, y: y0, z: 0 }, { x: x2, y: y0, z: 0 }, false);
+      const x2 = intersections[k + 1];
+      addBeamBetween(
+        { x: x1, y: y0, z: 0 },
+        { x: x2, y: y0, z: 0 },
+        false,
+        true
+      );
       }
     };
 
     xs.forEach(verticalSegments);
     ys.forEach(horizontalSegments);
 
-    // pilares exatamente nas interseções da malha
+        // pilares exatamente nas interseções da malha
+    const newPillars: Pillar[] = [];
     xs.forEach((x) => {
       ys.forEach((y) => {
         if (pointInPoly(x, y)) {
-          addPillarAt(x, y);
+          newPillars.push(addPillarDirect(x, y));
         }
       });
+    });
+
+    setPillars((prev) => {
+      const out = [...prev];
+      const tol = 1e-4;
+      newPillars.forEach((p) => {
+        const exists = out.some(
+          (q) => Math.hypot(q.x - p.x, q.y - p.y) < tol
+        );
+        if (!exists) out.push(p);
+      });
+      cleanupOrphanBeams(out);
+      return out;
     });
   };
 
@@ -827,60 +972,269 @@ function App() {
       base.diameter = pillarDiameter;
     }
 
-    setPillars((prev) => [...prev, base]);
+    setPillars((prev) => {
+      const next = [...prev, base];
+      return next;
+    });
+  };
+
+  const addPillarDirect = (x: number, y: number): Pillar => {
+    const id = Date.now() + Math.random();
+    const base: Pillar = {
+      id,
+      type: pillarType,
+      x,
+      y,
+      height: pillarHeight,
+    };
+    if (pillarType === "retangular") {
+      base.width = pillarWidth;
+      base.length = pillarLength;
+    } else {
+      base.diameter = pillarDiameter;
+    }
+    return base;
   };
 
   const deletePillar = (id: number) => {
-    setPillars((prev) => prev.filter((p) => p.id !== id));
-    setSelectedPillarId((prev) => (prev === id ? null : prev));
-  };
+  setPillars((prev) => {
+    const next = prev.filter((p) => p.id !== id);
+    cleanupOrphanBeams(next);
+    return next;
+  });
+  setSelectedPillarId((prev) => (prev === id ? null : prev));
+  setSelectedPillarIds((prev) => prev.filter((pid) => pid !== id));
+};
 
-  const applyBeamEdits = () => {
-    if (selectedBeamId == null) return;
-    setBeams((prev) =>
-      prev.map((b) =>
-        b.id === selectedBeamId
-          ? { ...b, width: editBeamWidth, height: editBeamHeight }
-          : b
-      )
+const deleteSelectedBeam = () => {
+  if (selectedBeamId == null) return;
+  setBeams((prev) => prev.filter((b) => b.id !== selectedBeamId));
+  setSelectedBeamId(null);
+  setSelectedBeamSegment(null);
+};
+
+const clearAllBeams = () => {
+  setBeams([]);
+  setSelectedBeamId(null);
+  setSelectedBeamSegment(null);
+};
+
+const clearAllPillars = () => {
+  setPillars([]);
+  setSelectedPillarId(null);
+  setSelectedPillarIds([]);
+  setBeams([]);
+  setSelectedBeamId(null);
+  setSelectedBeamSegment(null);
+  setMoveSelection({ start: null, current: null });
+};
+
+const applyBeamEdits = () => {
+  if (selectedBeamId == null) return;
+  setBeams((prev) =>
+    prev.map((b) =>
+      b.id === selectedBeamId
+        ? { ...b, width: editBeamWidth, height: editBeamHeight }
+        : b
+    )
+  );
+};
+
+const handlePillarClick = (id: number) => {
+  if (deleteMode) {
+    deletePillar(id);
+    return;
+  }
+  if (moveMode) {
+    setSelectedPillarIds((prev) =>
+      prev.includes(id) ? prev.filter((pid) => pid !== id) : [...prev, id]
     );
-  };
-
-  const handlePillarClick = (id: number) => {
-    if (deleteMode) {
-      deletePillar(id);
-      return;
-    }
     setSelectedPillarId(id);
     setSelectedBeamId(null);
     setSelectedBeamSegment(null);
-  };
+    return;
+  }
+  setSelectedPillarId(id);
+  setSelectedPillarIds([id]);
+  setSelectedBeamId(null);
+  setSelectedBeamSegment(null);
+};
 
-  const handleBeamClick = (item: Beam | BeamSegment) => {
-    const beamId = "beamId" in item ? item.beamId : item.id;
-    setSelectedBeamId(beamId);
-    setSelectedBeamSegment("beamId" in item ? item : null);
+const handlePillarPointerDown = (pillar: Pillar, e: any) => {
+  if (!moveMode || e?.nativeEvent?.buttons !== 1) return;
+  const ids = new Set<number>(selectedPillarIds);
+  if (selectedPillarId != null) ids.add(selectedPillarId);
+  ids.add(pillar.id);
+  const idsArr = Array.from(ids);
+  setSelectedPillarIds(idsArr);
+  setSelectedPillarId(pillar.id);
+  const origins = new Map<number, { x: number; y: number }>();
+  pillars.forEach((pp) => {
+    if (ids.has(pp.id)) origins.set(pp.id, { x: pp.x, y: pp.y });
+  });
+  const p = e.point;
+  setDragInitialPositions(origins);
+  setDragStartPoint({ x: p.x, y: p.y, z: p.z });
+  setIsDraggingPillars(true);
+  setMoveSelection({ start: null, current: null });
+};
+
+const handleBeamClick = (item: Beam | BeamSegment) => {
+  const beamId = "beamId" in item ? item.beamId : item.id;
+  setSelectedBeamId(beamId);
+  setSelectedBeamSegment("beamId" in item ? item : null);
+  setSelectedPillarId(null);
+  setSelectedPillarIds([]);
+  const beam = beams.find((b) => b.id === beamId);
+  if (beam) {
+    setEditBeamWidth(beam.width);
+    setEditBeamHeight(beam.height);
+  }
+};
+
+const movePillarsBy = (dx: number, dy: number) => {
+  const adjDx = moveAllowX ? dx : 0;
+  const adjDy = moveAllowY ? dy : 0;
+  const targets = new Set<number>(selectedPillarIds);
+  if (selectedPillarId != null) targets.add(selectedPillarId);
+  if (targets.size === 0) return;
+
+  const oldPos = new Map<number, { x: number; y: number }>();
+  pillars.forEach((p) => {
+    if (targets.has(p.id)) oldPos.set(p.id, { x: p.x, y: p.y });
+  });
+
+  const tol = 0.05; // 5 cm para casar vigas com pilares
+
+  const newPillars = pillars.map((p) =>
+    targets.has(p.id) ? { ...p, x: p.x + adjDx, y: p.y + adjDy } : p
+  );
+  setPillars(newPillars);
+
+  setBeams((prev) =>
+    prev
+      .map((b) => {
+        let x1 = b.x1;
+        let y1 = b.y1;
+        let x2 = b.x2;
+        let y2 = b.y2;
+
+        oldPos.forEach((pos) => {
+          if (Math.hypot(x1 - pos.x, y1 - pos.y) <= tol) {
+            x1 = pos.x + adjDx;
+            y1 = pos.y + adjDy;
+          }
+          if (Math.hypot(x2 - pos.x, y2 - pos.y) <= tol) {
+            x2 = pos.x + adjDx;
+            y2 = pos.y + adjDy;
+          }
+        });
+
+        const span = Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+        const height = span / 10;
+
+        return { ...b, x1, y1, x2, y2, height };
+      })
+      .filter((b) => beamHasPillar(b, newPillars))
+  );
+};
+
+const applyDragDelta = (
+  dx: number,
+  dy: number,
+  origins: Map<number, { x: number; y: number }>
+) => {
+  const adjDx = moveAllowX ? dx : 0;
+  const adjDy = moveAllowY ? dy : 0;
+  const tol = 0.05;
+  const newPillars = pillars.map((p) => {
+    const origin = origins.get(p.id);
+    if (!origin) return p;
+    return { ...p, x: origin.x + adjDx, y: origin.y + adjDy };
+  });
+  setPillars(newPillars);
+
+  setBeams((prev) =>
+    prev
+      .map((b) => {
+        let x1 = b.x1;
+        let y1 = b.y1;
+        let x2 = b.x2;
+        let y2 = b.y2;
+
+        origins.forEach((pos) => {
+          if (Math.hypot(x1 - pos.x, y1 - pos.y) <= tol) {
+            x1 = pos.x + adjDx;
+            y1 = pos.y + adjDy;
+          }
+          if (Math.hypot(x2 - pos.x, y2 - pos.y) <= tol) {
+            x2 = pos.x + adjDx;
+            y2 = pos.y + adjDy;
+          }
+        });
+
+        const span = Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+        const height = span / 10;
+
+        return { ...b, x1, y1, x2, y2, height };
+      })
+      .filter((b) => beamHasPillar(b, newPillars))
+  );
+};
+
+  const handlePlaneClick = (p: Point3, e?: any) => {
+  if (
+    moveMode &&
+    (selectedPillarIds.length > 0 || selectedPillarId != null) &&
+    e?.nativeEvent?.buttons === 1
+  ) {
+    const ids = new Set<number>([...selectedPillarIds]);
+    if (selectedPillarId != null) ids.add(selectedPillarId);
+    const origins = new Map<number, { x: number; y: number }>();
+    pillars.forEach((pp) => {
+      if (ids.has(pp.id)) origins.set(pp.id, { x: pp.x, y: pp.y });
+    });
+    setDragInitialPositions(origins);
+    setDragStartPoint(p);
+    setIsDraggingPillars(true);
+    setMoveSelection({ start: null, current: null });
+    return;
+  }
+  const anyMode =
+    drawRectBeamMode ||
+    drawPolylineMode ||
+    drawBeamMode ||
+    insertMode ||
+    measureMode ||
+    deleteMode;
+  if (!anyMode && !moveMode) {
+    setSelectedBeamId(null);
     setSelectedPillarId(null);
-    const beam = beams.find((b) => b.id === beamId);
-    if (beam) {
-      setEditBeamWidth(beam.width);
-      setEditBeamHeight(beam.height);
-    }
-  };
+    setSelectedPillarIds([]);
+    setSelectedBeamSegment(null);
+    setMoveSelection({ start: null, current: null });
+  }
 
-  const handlePlaneClick = (p: Point3) => {
-    const anyMode =
-      drawRectBeamMode ||
-      drawPolylineMode ||
-      drawBeamMode ||
-      insertMode ||
-      measureMode ||
-      deleteMode;
-    if (!anyMode) {
-      setSelectedBeamId(null);
-      setSelectedPillarId(null);
-      setSelectedBeamSegment(null);
+  if (moveMode) {
+    if (!moveSelection.start) {
+      setMoveSelection({ start: p, current: p });
+    } else {
+      const xMin = Math.min(moveSelection.start.x, p.x);
+      const xMax = Math.max(moveSelection.start.x, p.x);
+      const yMin = Math.min(moveSelection.start.y, p.y);
+      const yMax = Math.max(moveSelection.start.y, p.y);
+      const ids = pillars
+        .filter(
+          (pp) =>
+            pp.x >= xMin && pp.x <= xMax && pp.y >= yMin && pp.y <= yMax
+        )
+        .map((pp) => pp.id);
+      setSelectedPillarIds(ids);
+      setSelectedPillarId(ids[0] ?? null);
+      setMoveSelection({ start: null, current: null });
     }
+    return;
+  }
     
     // 0) MODO RETÂNGULO DE VIGAS (2 cliques = cantos opostos)
     if (drawRectBeamMode) {
@@ -891,23 +1245,25 @@ function App() {
 
       if (!rectTempStart) {
         // primeiro canto
-        setRectTempStart(p);
+        const snapped = snapToPillarPoint(p);
+        setRectTempStart(snapped);
       } else {
         // segundo canto -> cria os 4 lados de vigas
-        const xMin = Math.min(rectTempStart.x, p.x);
-        const xMax = Math.max(rectTempStart.x, p.x);
-        const yMin = Math.min(rectTempStart.y, p.y);
-        const yMax = Math.max(rectTempStart.y, p.y);
+        const snapped = snapToPillarPoint(p);
+        const xMin = Math.min(rectTempStart.x, snapped.x);
+        const xMax = Math.max(rectTempStart.x, snapped.x);
+        const yMin = Math.min(rectTempStart.y, snapped.y);
+        const yMax = Math.max(rectTempStart.y, snapped.y);
 
         const pA: Point3 = { x: xMin, y: yMin, z: 0 };
         const pB: Point3 = { x: xMax, y: yMin, z: 0 };
         const pC: Point3 = { x: xMax, y: yMax, z: 0 };
         const pD: Point3 = { x: xMin, y: yMax, z: 0 };
 
-        addBeamBetween(pA, pB, false);
-        addBeamBetween(pB, pC, false);
-        addBeamBetween(pC, pD, false);
-        addBeamBetween(pD, pA, false);
+        addBeamBetween(pA, pB, false, true);
+        addBeamBetween(pB, pC, false, true);
+        addBeamBetween(pC, pD, false, true);
+        addBeamBetween(pD, pA, false, true);
         generateGridInsidePolygon([pA, pB, pC, pD]);
 
         setRectTempStart(null);
@@ -922,12 +1278,13 @@ function App() {
       setSelectedBeamSegment(null);
 
       setPolyPoints((prev) => {
+        const snapped = snapToPillarPoint(p);
         if (prev.length === 0) {
-          return [p];
+          return [snapped];
         } else {
           const last = prev[prev.length - 1];
-          addBeamBetween(last, p, false);
-          return [...prev, p];
+          addBeamBetween(last, snapped, false, true);
+          return [...prev, snapped];
         }
       });
       return;
@@ -941,11 +1298,18 @@ function App() {
       setSelectedBeamSegment(null);
 
       if (!beamTempStart) {
-        // primeiro clique: guarda início
-        setBeamTempStart(p);
+        // primeiro clique: guarda in?cio
+        const snapped = snapToPillarPoint(p);
+        setBeamTempStart(snapped);
       } else {
-        // segundo clique: cria viga e limpa início
-        addBeamBetween(beamTempStart, p);
+        // segundo clique: cria viga e limpa in?cio
+        let end = snapToPillarPoint(p);
+        if (drawAxisLock === "x") {
+          end = { ...end, x: beamTempStart.x };
+        } else if (drawAxisLock === "y") {
+          end = { ...end, y: beamTempStart.y };
+        }
+        addBeamBetween(beamTempStart, end);
         setBeamTempStart(null);
       }
       return;
@@ -973,6 +1337,24 @@ function App() {
       }
       return updated;
     });
+  };
+
+  const handlePlaneMove = (p: Point3, e?: any) => {
+    if (moveMode && moveSelection.start && !isDraggingPillars) {
+      setMoveSelection({ start: moveSelection.start, current: p });
+    }
+    if (!moveMode || !isDraggingPillars || !dragStartPoint) return;
+    if (e?.nativeEvent?.buttons !== 1) return;
+    const dx = p.x - dragStartPoint.x;
+    const dy = p.y - dragStartPoint.y;
+    applyDragDelta(dx, dy, dragInitialPositions);
+  };
+
+  const handlePlaneUp = () => {
+    if (!isDraggingPillars) return;
+    setIsDraggingPillars(false);
+    setDragStartPoint(null);
+    setDragInitialPositions(new Map());
   };
 
 
@@ -1128,6 +1510,29 @@ function App() {
       };
     })();
 
+  const selectionRect =
+    moveMode && moveSelection.start && moveSelection.current
+      ? (() => {
+          const xMin = Math.min(moveSelection.start.x, moveSelection.current.x);
+          const xMax = Math.max(moveSelection.start.x, moveSelection.current.x);
+          const yMin = Math.min(moveSelection.start.y, moveSelection.current.y);
+          const yMax = Math.max(moveSelection.start.y, moveSelection.current.y);
+          return {
+            xMin,
+            xMax,
+            yMin,
+            yMax,
+            width: xMax - xMin,
+            height: yMax - yMin,
+            center: {
+              x: (xMin + xMax) / 2,
+              y: (yMin + yMax) / 2,
+              z: 0.01,
+            },
+          };
+        })()
+      : null;
+
   return (
     <div style={{ display: "flex", width: "100vw", height: "100vh" }}>
       {/* PAINEL LATERAL */}
@@ -1276,6 +1681,8 @@ function App() {
                     setMeasureMode((v) => !v);
                     setInsertMode(false);
                     setDeleteMode(false);
+                    setMoveMode(false);
+                    setMoveSelection({ start: null, current: null });
                   }}
                   style={{
                     width: "100%",
@@ -1518,6 +1925,8 @@ function App() {
                   });
                   setMeasureMode(false);
                   setDeleteMode(false);
+                  setMoveMode(false);
+                  setMoveSelection({ start: null, current: null });
                 }}
                 style={{
                   width: "100%",
@@ -1542,6 +1951,8 @@ function App() {
                   setDeleteMode((v) => !v);
                   setInsertMode(false);
                   setMeasureMode(false);
+                  setMoveMode(false);
+                  setMoveSelection({ start: null, current: null });
                 }}
                 style={{
                   width: "100%",
@@ -1615,6 +2026,44 @@ function App() {
                   </div>
                 </div>
 
+                <div style={{ marginBottom: 8 }}>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>
+                    Trava de eixo (modo desenhar viga):
+                  </div>
+                  <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                      <input
+                        type="radio"
+                        name="drawAxisLock"
+                        value="none"
+                        checked={drawAxisLock === "none"}
+                        onChange={() => setDrawAxisLock("none")}
+                      />
+                      Livre
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                      <input
+                        type="radio"
+                        name="drawAxisLock"
+                        value="x"
+                        checked={drawAxisLock === "x"}
+                        onChange={() => setDrawAxisLock("x")}
+                      />
+                      Travar X
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                      <input
+                        type="radio"
+                        name="drawAxisLock"
+                        value="y"
+                        checked={drawAxisLock === "y"}
+                        onChange={() => setDrawAxisLock("y")}
+                      />
+                      Travar Y
+                    </label>
+                  </div>
+                </div>
+
                 <button
                   onClick={() => {
                     const novo = !drawBeamMode;
@@ -1627,6 +2076,8 @@ function App() {
                     setInsertMode(false);
                     setMeasureMode(false);
                     setDeleteMode(false);
+                    setMoveMode(false);
+                    setMoveSelection({ start: null, current: null });
                   }}
                   style={{
                     width: "100%",
@@ -1657,6 +2108,8 @@ function App() {
                     setInsertMode(false);
                     setMeasureMode(false);
                     setDeleteMode(false);
+                    setMoveMode(false);
+                    setMoveSelection({ start: null, current: null });
                   }}
                   style={{
                     width: "100%",
@@ -1687,6 +2140,8 @@ function App() {
                     setInsertMode(false);
                     setMeasureMode(false);
                     setDeleteMode(false);
+                    setMoveMode(false);
+                    setMoveSelection({ start: null, current: null });
                   }}
                   style={{
                     width: "100%",
@@ -1830,6 +2285,248 @@ function App() {
           )}
         </div>
 
+        {/* SE€ÇO MODIFICAR */}
+        <div
+          style={{
+            marginBottom: 8,
+            borderRadius: 8,
+            overflow: "hidden",
+            border: "1px solid #333",
+          }}
+        >
+          <button
+            onClick={() => setActivePanel("modify")}
+            style={{
+              width: "100%",
+              textAlign: "left",
+              padding: "8px 10px",
+              background:
+                activePanel === "modify"
+                  ? "#ff0080"
+                  : "rgba(255,255,255,0.04)",
+              color: activePanel === "modify" ? "#fff" : "#eee",
+              border: "none",
+              cursor: "pointer",
+              fontWeight: 600,
+            }}
+          >
+            ✏️ Modificar
+          </button>
+
+          {activePanel === "modify" && (
+            <div
+              style={{ padding: "10px 10px 12px 10px", background: "#181818" }}
+            >
+              <div
+                style={{
+                  marginBottom: 12,
+                  padding: 8,
+                  borderRadius: 6,
+                  background: "#111",
+                  border: "1px solid #333",
+                }}
+              >
+                <div style={{ marginBottom: 6, opacity: 0.85 }}>
+                  Mover pilares
+                </div>
+                <button
+                  onClick={() => {
+                    const next = !moveMode;
+                    setMoveMode(next);
+                    if (next) {
+                      setDrawBeamMode(false);
+                      setDrawRectBeamMode(false);
+                      setDrawPolylineMode(false);
+                      setInsertMode(false);
+                      setMeasureMode(false);
+                      setDeleteMode(false);
+                      setBeamTempStart(null);
+                      setRectTempStart(null);
+                      setPolyPoints([]);
+                      setSelectedBeamId(null);
+                      setSelectedBeamSegment(null);
+                    } else {
+                      setMoveSelection({ start: null, current: null });
+                      setIsDraggingPillars(false);
+                      setDragStartPoint(null);
+                      setDragInitialPositions(new Map());
+                    }
+                  }}
+                  style={{
+                    width: "100%",
+                    padding: 6,
+                    borderRadius: 4,
+                    border: "none",
+                    cursor: "pointer",
+                    background: moveMode ? "#ffddaa" : "#225577",
+                    color: moveMode ? "#333" : "#fff",
+                    fontSize: 13,
+                    marginBottom: 6,
+                  }}
+                >
+                  {moveMode
+                    ? "Selecione pilares (clique ou retangulo)"
+                    : "Modo mover pilares"}
+                </button>
+                <div
+                  style={{
+                    fontSize: 12,
+                    opacity: 0.8,
+                    marginBottom: 6,
+                    lineHeight: "16px",
+                  }}
+                >
+                  No modo mover, clique em pilares para selecionar ou clique
+                  duas vezes na planta para criar um retangulo de selecao. Depois
+                  aplique um deslocamento.
+                </div>
+                <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={moveAllowX}
+                      onChange={(e) => setMoveAllowX(e.target.checked)}
+                    />
+                    Deslocamento em X
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={moveAllowY}
+                      onChange={(e) => setMoveAllowY(e.target.checked)}
+                    />
+                    Deslocamento em Y
+                  </label>
+                </div>
+                <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11 }}>Delta X (m)</div>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={moveDx}
+                      onChange={(e) => setMoveDx(Number(e.target.value))}
+                      style={{
+                        width: "100%",
+                        background: "#111",
+                        color: "#fff",
+                        border: "1px solid #333",
+                        borderRadius: 4,
+                        padding: "2px 4px",
+                        marginTop: 2,
+                      }}
+                    />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11 }}>Delta Y (m)</div>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={moveDy}
+                      onChange={(e) => setMoveDy(Number(e.target.value))}
+                      style={{
+                        width: "100%",
+                        background: "#111",
+                        color: "#fff",
+                        border: "1px solid #333",
+                        borderRadius: 4,
+                        padding: "2px 4px",
+                        marginTop: 2,
+                      }}
+                    />
+                  </div>
+                </div>
+                <button
+                  onClick={() => movePillarsBy(moveDx, moveDy)}
+                  disabled={
+                    selectedPillarIds.length === 0 && selectedPillarId == null
+                  }
+                  style={{
+                    width: "100%",
+                    padding: 6,
+                    borderRadius: 4,
+                    border: "none",
+                    cursor:
+                      selectedPillarIds.length === 0 && selectedPillarId == null
+                        ? "not-allowed"
+                        : "pointer",
+                    background:
+                      selectedPillarIds.length === 0 && selectedPillarId == null
+                        ? "#555"
+                        : "#008855",
+                    color: "#fff",
+                    fontSize: 12,
+                  }}
+                >
+                  Aplicar deslocamento
+                </button>
+              </div>
+
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: 8,
+                  borderRadius: 6,
+                  background: "#111",
+                  border: "1px solid #333",
+                }}
+              >
+                <div style={{ marginBottom: 6, opacity: 0.85 }}>
+                  Limpeza / apagar
+                </div>
+                <button
+                  onClick={deleteSelectedBeam}
+                  disabled={selectedBeamId == null}
+                  style={{
+                    width: "100%",
+                    padding: 6,
+                    borderRadius: 4,
+                    border: "none",
+                    cursor: selectedBeamId == null ? "not-allowed" : "pointer",
+                    background: selectedBeamId == null ? "#555" : "#884444",
+                    color: "#fff",
+                    fontSize: 12,
+                    marginBottom: 6,
+                  }}
+                >
+                  Apagar viga selecionada
+                </button>
+                <button
+                  onClick={clearAllBeams}
+                  style={{
+                    width: "100%",
+                    padding: 6,
+                    borderRadius: 4,
+                    border: "none",
+                    cursor: "pointer",
+                    background: "#aa5500",
+                    color: "#fff",
+                    fontSize: 12,
+                    marginBottom: 6,
+                  }}
+                >
+                  Apagar todas as vigas
+                </button>
+                <button
+                  onClick={clearAllPillars}
+                  style={{
+                    width: "100%",
+                    padding: 6,
+                    borderRadius: 4,
+                    border: "none",
+                    cursor: "pointer",
+                    background: "#aa2200",
+                    color: "#fff",
+                    fontSize: 12,
+                  }}
+                >
+                  Apagar todos os pilares
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
       </div>
 
       {/* CANVAS */}
@@ -1849,7 +2546,11 @@ function App() {
           />
 
           <ambientLight />
-          <CameraController viewMode={viewMode} resetToken={resetToken} />
+          <CameraController
+            viewMode={viewMode}
+            resetToken={resetToken}
+            allowPan={!(moveMode && isDraggingPillars)}
+          />
 
           {!pdf && <gridHelper args={[50, 50]} />}
           {!pdf && <axesHelper args={[10]} />}
@@ -1859,17 +2560,33 @@ function App() {
               pdf={pdf}
               scaleDenominator={scaleDenominator}
               onPlaneClick={handlePlaneClick}
+              onPlaneMove={handlePlaneMove}
+              onPlaneUp={handlePlaneUp}
+              capturePointer={
+                moveMode ||
+                drawBeamMode ||
+                drawRectBeamMode ||
+                drawPolylineMode ||
+                insertMode ||
+                measureMode ||
+                deleteMode
+              }
             />
           )}
 
       {pillars.map((p) => (
-        <PillarMesh
-          key={p.id}
-          pillar={p}
-          isSelected={selectedPillarId === p.id}
-          onClick={() => handlePillarClick(p.id)}
-        />
-      ))}
+      <PillarMesh
+        key={p.id}
+        pillar={p}
+        isSelected={
+          selectedPillarId === p.id || selectedPillarIds.includes(p.id)
+        }
+        onClick={() => handlePillarClick(p.id)}
+        onPointerDown={(pillar, e) => handlePillarPointerDown(pillar, e)}
+        onPointerMove={(point, e) => handlePlaneMove(point, e)}
+        onPointerUp={handlePlaneUp}
+      />
+    ))}
       
       {beams.flatMap((b) => splitBeamIntoSegments(b)).map((seg) => (
         <BeamMesh
@@ -1881,6 +2598,30 @@ function App() {
         />
       ))}
 
+      {selectionRect && (
+        <group>
+          <Line
+            raycast={(_r: any, _i: any) => null}
+            points={[
+              [selectionRect.xMin, selectionRect.yMin, 0.05],
+              [selectionRect.xMax, selectionRect.yMin, 0.05],
+              [selectionRect.xMax, selectionRect.yMax, 0.05],
+              [selectionRect.xMin, selectionRect.yMax, 0.05],
+              [selectionRect.xMin, selectionRect.yMin, 0.05],
+            ]}
+            color="#00aaff"
+            lineWidth={1}
+            dashed
+          />
+          <mesh
+            raycast={(_r: any, _i: any) => null}
+            position={[selectionRect.center.x, selectionRect.center.y, selectionRect.center.z]}
+          >
+            <planeGeometry args={[Math.max(selectionRect.width, 0.0001), Math.max(selectionRect.height, 0.0001)]} />
+            <meshBasicMaterial color="#00aaff" transparent opacity={0.15} />
+          </mesh>
+        </group>
+      )}
 
 
           {lastMeasurement && (
@@ -2020,3 +2761,4 @@ function App() {
 
 
 export default App;
+
