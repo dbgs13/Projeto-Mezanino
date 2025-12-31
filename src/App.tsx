@@ -37,6 +37,8 @@ type Pillar = {
 };
 type Beam = {
   id: number;
+  startId: number;
+  endId: number;
   x1: number;
   y1: number;
   x2: number;
@@ -560,7 +562,7 @@ function App() {
     const dist = Math.hypot(first.x - last.x, first.y - last.y);
 
     if (dist > 1e-6) {
-      addBeamBetween(last, first, false, true);
+      addBeamBetween(last, first);
     }
 
     if (polyPoints.length >= 3) {
@@ -607,8 +609,6 @@ const [editBeamHeight, setEditBeamHeight] = useState(0.3); // m (valor inicial q
 const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
   "pdf"
 );
-const [showPillarSection, setShowPillarSection] = useState(true);
-const [showBeamSection, setShowBeamSection] = useState(true);
 
   const isOrtho = viewMode !== "3d";
 
@@ -655,70 +655,6 @@ const [showBeamSection, setShowBeamSection] = useState(true);
     setLoading(false);
   };
   
-  // Gera pilares ao longo de um segmento de viga, respeitando vãos máximos em X/Y
-  const generatePillarsForSegment = (p1: Point3, p2: Point3) => {
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
-    const span = Math.sqrt(dx * dx + dy * dy);
-    if (span === 0) return;
-
-    // Decide qual vão máximo usar (X ou Y) com base na direção dominante
-    const useX = Math.abs(dx) >= Math.abs(dy);
-    const maxSpan = useX ? maxSpanX : maxSpanY;
-    if (maxSpan <= 0) return;
-
-    const nSegments = Math.ceil(span / maxSpan);
-    const spacing = span / nSegments;
-    const ux = dx / span;
-    const uy = dy / span;
-
-    const positions: { x: number; y: number }[] = [];
-    for (let i = 0; i <= nSegments; i++) {
-      const s = spacing * i;
-      positions.push({
-        x: p1.x + ux * s,
-        y: p1.y + uy * s,
-      });
-    }
-
-    const tol = 0.01; // ~1 cm
-
-    setPillars((prev) => {
-      const out = [...prev];
-
-      positions.forEach((pos) => {
-        const exists = out.some((p) => {
-          const ddx = p.x - pos.x;
-          const ddy = p.y - pos.y;
-          return Math.sqrt(ddx * ddx + ddy * ddy) < tol;
-        });
-
-        if (!exists) {
-          const id = Date.now() + Math.random();
-          const base: Pillar = {
-            id,
-            type: pillarType,
-            x: pos.x,
-            y: pos.y,
-            height: pillarHeight,
-          };
-
-          if (pillarType === "retangular") {
-            base.width = pillarWidth;
-            base.length = pillarLength;
-          } else {
-            base.diameter = pillarDiameter;
-          }
-
-          out.push(base);
-        }
-      });
-
-      return out;
-    });
-  };
-
-  // lista de posições de grade incluindo bordas, respeitando vão máximo
   const buildGridPositions = (min: number, max: number, maxSpan: number) => {
     if (maxSpan <= 0) return [min, max];
     const positions = [min];
@@ -745,16 +681,38 @@ const [showBeamSection, setShowBeamSection] = useState(true);
       }
     });
     if (!best) return p;
-    return { ...p, x: best.x, y: best.y };
+    const snapped = best as Pillar;
+    return { ...p, x: snapped.x, y: snapped.y };
   };
 
-  const beamHasPillar = (beam: Beam, list: Pillar[] = pillars) => {
-    const tol = 0.05;
-    return list.some(
-      (p) =>
-        Math.hypot(p.x - beam.x1, p.y - beam.y1) <= tol ||
-        Math.hypot(p.x - beam.x2, p.y - beam.y2) <= tol
-    );
+  const buildPillarMap = (list: Pillar[]) => {
+    const m = new Map<number, Pillar>();
+    list.forEach((p) => m.set(p.id, p));
+    return m;
+  };
+
+  const refreshBeamsFromAnchors = (beamList: Beam[], pillarList: Pillar[]) => {
+    const map = buildPillarMap(pillarList);
+    const next: Beam[] = [];
+    beamList.forEach((b) => {
+      const a = map.get(b.startId);
+      const c = map.get(b.endId);
+      if (!a || !c) return;
+      const x1 = a.x;
+      const y1 = a.y;
+      const x2 = c.x;
+      const y2 = c.y;
+      const span = Math.hypot(x2 - x1, y2 - y1);
+      const height = span / 10;
+      next.push({ ...b, x1, y1, x2, y2, height });
+    });
+    return next;
+  };
+
+  const beamHasPillar = (beam: Beam, list?: Pillar[]) => {
+    const arr: Pillar[] = list ?? pillars;
+    const ids = new Set(arr.map((p) => p.id));
+    return ids.has(beam.startId) && ids.has(beam.endId);
   };
 
   const cleanupOrphanBeams = (list?: Pillar[]) => {
@@ -762,62 +720,60 @@ const [showBeamSection, setShowBeamSection] = useState(true);
     setBeams((prev) => prev.filter((b) => beamHasPillar(b, ref)));
   };
 
-  const isSameSegment = (b: Beam, p1: Point3, p2: Point3) => {
-    const tol = 1e-4;
-    const match = (x1: number, y1: number, x2: number, y2: number) =>
-      Math.hypot(x1 - x2, y1 - y2) < tol;
+  const addBeamBetween = (p1: Point3, p2: Point3) => {
+    const snapTol = 0.4;
+    let working = [...pillars];
+    const findNear = (pt: Point3) =>
+      working.find((pl) => Math.hypot(pl.x - pt.x, pl.y - pt.y) <= snapTol);
 
-    const direct =
-      match(b.x1, b.y1, p1.x, p1.y) && match(b.x2, b.y2, p2.x, p2.y);
-    const reverse =
-      match(b.x1, b.y1, p2.x, p2.y) && match(b.x2, b.y2, p1.x, p1.y);
-    return direct || reverse;
-  };
+    const ensurePillar = (pt: Point3) => {
+      const found = findNear(pt);
+      if (found) return found;
+      const created = addPillarDirect(pt.x, pt.y);
+      working.push(created);
+      return created;
+    };
 
-  const addBeamBetween = (
-    p1: Point3,
-    p2: Point3,
-    withPillars = true,
-    allowOrphan = false
-  ) => {
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
-    const span = Math.sqrt(dx * dx + dy * dy);
-
+    const a = ensurePillar(p1);
+    const b = ensurePillar(p2);
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const span = Math.hypot(dx, dy);
     if (span === 0) return;
 
-    // Seção automática
-    const width = 0.15;        // 15 cm
-    const height = span / 10;  // h = vão / 10
-
+    const width = 0.15;
+    const height = span / 10;
     const id = Date.now() + Math.random();
 
     const newBeam: Beam = {
       id,
-      x1: p1.x,
-      y1: p1.y,
-      x2: p2.x,
-      y2: p2.y,
+      startId: a.id,
+      endId: b.id,
+      x1: a.x,
+      y1: a.y,
+      x2: b.x,
+      y2: b.y,
       width,
       height,
     };
 
-    setBeams((prev) => {
-      if (prev.some((b) => isSameSegment(b, p1, p2))) return prev;
-      if (!allowOrphan && !withPillars && !beamHasPillar(newBeam)) return prev;
-      return [...prev, newBeam];
-    });
-
-    if (withPillars) {
-      // 🔹 gera pilares automaticamente ao longo da viga
-      generatePillarsForSegment(p1, p2);
+    const exists = beams.some(
+      (bb) =>
+        (bb.startId === newBeam.startId && bb.endId === newBeam.endId) ||
+        (bb.startId === newBeam.endId && bb.endId === newBeam.startId)
+    );
+    if (exists) {
+      setPillars(working);
+      setBeams(refreshBeamsFromAnchors(beams, working));
+      return;
     }
 
-    if (!withPillars && !allowOrphan) {
-      cleanupOrphanBeams();
-    }
+    const nextBeams = [...beams, newBeam];
+    const enforced = enforceAutoPillars(working, nextBeams);
+    const refreshed = refreshBeamsFromAnchors(nextBeams, enforced);
+    setPillars(enforced);
+    setBeams(refreshed);
   };
-
 
   const generateGridInsidePolygon = (poly: Point3[]) => {
     if (!poly || poly.length < 3) return;
@@ -883,9 +839,7 @@ const [showBeamSection, setShowBeamSection] = useState(true);
       const y2 = intersections[k + 1];
       addBeamBetween(
         { x: x0, y: y1, z: 0 },
-        { x: x0, y: y2, z: 0 },
-        false,
-        true
+        { x: x0, y: y2, z: 0 }
       );
       }
     };
@@ -911,9 +865,7 @@ const [showBeamSection, setShowBeamSection] = useState(true);
       const x2 = intersections[k + 1];
       addBeamBetween(
         { x: x1, y: y0, z: 0 },
-        { x: x2, y: y0, z: 0 },
-        false,
-        true
+        { x: x2, y: y0, z: 0 }
       );
       }
     };
@@ -997,6 +949,99 @@ const [showBeamSection, setShowBeamSection] = useState(true);
       base.diameter = pillarDiameter;
     }
     return base;
+  };
+
+  const makeAutoPillar = (x: number, y: number): Pillar => ({
+    id: Date.now() + Math.random(),
+    type: pillarType,
+    x,
+    y,
+    height: pillarHeight,
+    width: pillarType === "retangular" ? pillarWidth : undefined,
+    length: pillarType === "retangular" ? pillarLength : undefined,
+    diameter: pillarType === "circular" ? pillarDiameter : undefined,
+    auto: true,
+  });
+
+  // Insere pilares automáticos quando o vão excede o máximo e remove autos redundantes
+  const enforceAutoPillars = (pillarList: Pillar[], beamList: Beam[]) => {
+    const tolPerp = 0.02; // pequeno, mas permite achar autos na linha
+    const tolPos = 0.02;
+    const pillarsWork: Pillar[] = [...pillarList];
+    const key = (x: number, y: number) => `${x.toFixed(4)}|${y.toFixed(4)}`;
+
+    const findAt = (x: number, y: number) =>
+      pillarsWork.find((p) => Math.hypot(p.x - x, p.y - y) <= tolPos);
+
+    const ensureAutoAt = (x: number, y: number) => {
+      const found = findAt(x, y);
+      if (found) return found.id;
+      const created = makeAutoPillar(x, y);
+      pillarsWork.push(created);
+      return created.id;
+    };
+
+    beamList.forEach((b) => {
+      const dx = b.x2 - b.x1;
+      const dy = b.y2 - b.y1;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) return;
+      const useX = Math.abs(dx) >= Math.abs(dy);
+      const maxSpan = useX ? maxSpanX : maxSpanY;
+      const ux = dx / len;
+      const uy = dy / len;
+
+      const pillarOnBeam = (p: Pillar) => {
+        const vx = p.x - b.x1;
+        const vy = p.y - b.y1;
+        const t = vx * ux + vy * uy;
+        if (t < -tolPos || t > len + tolPos) return false;
+        const perp = Math.abs(vx * -uy + vy * ux);
+        return perp <= tolPerp;
+      };
+
+      if (maxSpan <= 0 || len <= maxSpan + tolPos) {
+        // remove autos internos desse vão
+        for (let i = pillarsWork.length - 1; i >= 0; i--) {
+          const p = pillarsWork[i];
+          if (!p.auto) continue;
+          if (!pillarOnBeam(p)) continue;
+          const t = (p.x - b.x1) * ux + (p.y - b.y1) * uy;
+          if (t <= tolPos || t >= len - tolPos) continue; // mantêm extremos
+          pillarsWork.splice(i, 1);
+        }
+        return;
+      }
+
+      for (let d = maxSpan; d < len - tolPos; d += maxSpan) {
+        const x = b.x1 + ux * d;
+        const y = b.y1 + uy * d;
+        ensureAutoAt(x, y);
+      }
+    });
+
+    // remove autos não usados em nenhuma viga
+    const usedKeys = new Set<string>();
+    beamList.forEach((b) => {
+      usedKeys.add(key(b.x1, b.y1));
+      usedKeys.add(key(b.x2, b.y2));
+      const dx = b.x2 - b.x1;
+      const dy = b.y2 - b.y1;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) return;
+      const ux = dx / len;
+      const uy = dy / len;
+      pillarsWork.forEach((p) => {
+        const vx = p.x - b.x1;
+        const vy = p.y - b.y1;
+        const t = vx * ux + vy * uy;
+        if (t < -tolPos || t > len + tolPos) return;
+        const perp = Math.abs(vx * -uy + vy * ux);
+        if (perp <= tolPerp) usedKeys.add(key(p.x, p.y));
+      });
+    });
+
+    return pillarsWork.filter((p) => !p.auto || usedKeys.has(key(p.x, p.y)));
   };
 
   const deletePillar = (id: number) => {
@@ -1095,52 +1140,24 @@ const handleBeamClick = (item: Beam | BeamSegment) => {
   }
 };
 
-const movePillarsBy = (dx: number, dy: number) => {
-  const adjDx = moveAllowX ? dx : 0;
-  const adjDy = moveAllowY ? dy : 0;
-  const targets = new Set<number>(selectedPillarIds);
-  if (selectedPillarId != null) targets.add(selectedPillarId);
-  if (targets.size === 0) return;
+  const movePillarsBy = (dx: number, dy: number) => {
+    const adjDx = moveAllowX ? dx : 0;
+    const adjDy = moveAllowY ? dy : 0;
+    const targets = new Set<number>(selectedPillarIds);
+    if (selectedPillarId != null) targets.add(selectedPillarId);
+    if (targets.size === 0) return;
 
-  const oldPos = new Map<number, { x: number; y: number }>();
-  pillars.forEach((p) => {
-    if (targets.has(p.id)) oldPos.set(p.id, { x: p.x, y: p.y });
-  });
+    const newPillars = pillars.map((p) =>
+      targets.has(p.id) ? { ...p, x: p.x + adjDx, y: p.y + adjDy } : p
+    );
 
-  const tol = 0.05; // 5 cm para casar vigas com pilares
-
-  const newPillars = pillars.map((p) =>
-    targets.has(p.id) ? { ...p, x: p.x + adjDx, y: p.y + adjDy } : p
-  );
-  setPillars(newPillars);
-
-  setBeams((prev) =>
-    prev
-      .map((b) => {
-        let x1 = b.x1;
-        let y1 = b.y1;
-        let x2 = b.x2;
-        let y2 = b.y2;
-
-        oldPos.forEach((pos) => {
-          if (Math.hypot(x1 - pos.x, y1 - pos.y) <= tol) {
-            x1 = pos.x + adjDx;
-            y1 = pos.y + adjDy;
-          }
-          if (Math.hypot(x2 - pos.x, y2 - pos.y) <= tol) {
-            x2 = pos.x + adjDx;
-            y2 = pos.y + adjDy;
-          }
-        });
-
-        const span = Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
-        const height = span / 10;
-
-        return { ...b, x1, y1, x2, y2, height };
-      })
-      .filter((b) => beamHasPillar(b, newPillars))
-  );
-};
+    const recalculated = refreshBeamsFromAnchors(beams, newPillars).filter(
+      (b) => beamHasPillar(b, newPillars)
+    );
+    const enforced = enforceAutoPillars(newPillars, recalculated);
+    setPillars(enforced);
+    setBeams(refreshBeamsFromAnchors(recalculated, enforced));
+  };
 
 const applyDragDelta = (
   dx: number,
@@ -1149,40 +1166,19 @@ const applyDragDelta = (
 ) => {
   const adjDx = moveAllowX ? dx : 0;
   const adjDy = moveAllowY ? dy : 0;
-  const tol = 0.05;
   const newPillars = pillars.map((p) => {
     const origin = origins.get(p.id);
     if (!origin) return p;
     return { ...p, x: origin.x + adjDx, y: origin.y + adjDy };
   });
-  setPillars(newPillars);
 
-  setBeams((prev) =>
-    prev
-      .map((b) => {
-        let x1 = b.x1;
-        let y1 = b.y1;
-        let x2 = b.x2;
-        let y2 = b.y2;
-
-        origins.forEach((pos) => {
-          if (Math.hypot(x1 - pos.x, y1 - pos.y) <= tol) {
-            x1 = pos.x + adjDx;
-            y1 = pos.y + adjDy;
-          }
-          if (Math.hypot(x2 - pos.x, y2 - pos.y) <= tol) {
-            x2 = pos.x + adjDx;
-            y2 = pos.y + adjDy;
-          }
-        });
-
-        const span = Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
-        const height = span / 10;
-
-        return { ...b, x1, y1, x2, y2, height };
-      })
-      .filter((b) => beamHasPillar(b, newPillars))
+  const newBeams = refreshBeamsFromAnchors(beams, newPillars).filter((b) =>
+    beamHasPillar(b, newPillars)
   );
+
+  const enforced = enforceAutoPillars(newPillars, newBeams);
+  setPillars(enforced);
+  setBeams(refreshBeamsFromAnchors(newBeams, enforced));
 };
 
   const handlePlaneClick = (p: Point3, e?: any) => {
@@ -1263,10 +1259,10 @@ const applyDragDelta = (
         const pC: Point3 = { x: xMax, y: yMax, z: 0 };
         const pD: Point3 = { x: xMin, y: yMax, z: 0 };
 
-        addBeamBetween(pA, pB, false, true);
-        addBeamBetween(pB, pC, false, true);
-        addBeamBetween(pC, pD, false, true);
-        addBeamBetween(pD, pA, false, true);
+        addBeamBetween(pA, pB);
+        addBeamBetween(pB, pC);
+        addBeamBetween(pC, pD);
+        addBeamBetween(pD, pA);
         generateGridInsidePolygon([pA, pB, pC, pD]);
 
         setRectTempStart(null);
@@ -1286,7 +1282,7 @@ const applyDragDelta = (
           return [snapped];
         } else {
           const last = prev[prev.length - 1];
-          addBeamBetween(last, snapped, false, true);
+          addBeamBetween(last, snapped);
           return [...prev, snapped];
         }
       });
