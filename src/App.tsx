@@ -720,9 +720,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     setBeams((prev) => prev.filter((b) => beamHasPillar(b, ref)));
   };
 
-  const addBeamBetween = (p1: Point3, p2: Point3) => {
+  const applyAddBeamBetween = (
+    p1: Point3,
+    p2: Point3,
+    basePillars: Pillar[] = pillars,
+    baseBeams: Beam[] = beams
+  ) => {
     const snapTol = 0.4;
-    let working = [...pillars];
+    let working = [...basePillars];
     const findNear = (pt: Point3) =>
       working.find((pl) => Math.hypot(pl.x - pt.x, pl.y - pt.y) <= snapTol);
 
@@ -739,7 +744,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const span = Math.hypot(dx, dy);
-    if (span === 0) return;
+    if (span === 0) return { pillars: working, beams: baseBeams };
 
     const width = 0.15;
     const height = span / 10;
@@ -757,25 +762,28 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       height,
     };
 
-    const exists = beams.some(
+    const exists = baseBeams.some(
       (bb) =>
         (bb.startId === newBeam.startId && bb.endId === newBeam.endId) ||
         (bb.startId === newBeam.endId && bb.endId === newBeam.startId)
     );
-    if (exists) {
-      setPillars(working);
-      setBeams(refreshBeamsFromAnchors(beams, working));
-      return;
-    }
-
-    const nextBeams = [...beams, newBeam];
+    const nextBeams = exists ? baseBeams : [...baseBeams, newBeam];
     const enforced = enforceAutoPillars(working, nextBeams);
     const refreshed = refreshBeamsFromAnchors(nextBeams, enforced);
-    setPillars(enforced);
-    setBeams(refreshed);
+    return { pillars: enforced, beams: refreshed };
   };
 
-  const generateGridInsidePolygon = (poly: Point3[]) => {
+  const addBeamBetween = (p1: Point3, p2: Point3) => {
+    const res = applyAddBeamBetween(p1, p2);
+    setPillars(res.pillars);
+    setBeams(res.beams);
+  };
+
+  const generateGridInsidePolygon = (
+    poly: Point3[],
+    basePillars: Pillar[] = pillars,
+    baseBeams: Beam[] = beams
+  ) => {
     if (!poly || poly.length < 3) return;
     const n = poly.length;
 
@@ -794,6 +802,49 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const xs = buildGridPositions(minX, maxX, maxSpanX);
     const ys = buildGridPositions(minY, maxY, maxSpanY);
 
+    // Caso o polígono seja um retângulo alinhado aos eixos, force a malha regular
+    const isAxisAlignedRect =
+      n === 4 &&
+      poly.every((p, i) => {
+        const q = poly[(i + 1) % n];
+        return Math.abs(p.x - q.x) < 1e-6 || Math.abs(p.y - q.y) < 1e-6;
+      });
+
+    if (isAxisAlignedRect) {
+      let curP: Pillar[] = [];
+      let curB: Beam[] = [];
+      const ensureP = (x: number, y: number) => {
+        const found = curP.find((pp) => Math.hypot(pp.x - x, pp.y - y) < 1e-4);
+        if (found) return found;
+        const created = addPillarDirect(x, y);
+        curP.push(created);
+        return created;
+      };
+      const addEdge = (pa: Point3, pb: Point3) => {
+        const res = applyAddBeamBetween(pa, pb, curP, curB);
+        curP = res.pillars;
+        curB = res.beams;
+      };
+
+      ys.forEach((y) => xs.forEach((x) => ensureP(x, y)));
+      ys.forEach((y) => {
+        for (let i = 0; i < xs.length - 1; i++) {
+          addEdge({ x: xs[i], y, z: 0 }, { x: xs[i + 1], y, z: 0 });
+        }
+      });
+      xs.forEach((x) => {
+        for (let j = 0; j < ys.length - 1; j++) {
+          addEdge({ x, y: ys[j], z: 0 }, { x, y: ys[j + 1], z: 0 });
+        }
+      });
+
+      const enforced = enforceAutoPillars(curP, curB);
+      const refreshed = refreshBeamsFromAnchors(curB, enforced);
+      setPillars(enforced);
+      setBeams(refreshed);
+      return;
+    }
+
     const pointInPoly = (x: number, y: number) => {
       let inside = false;
       for (let i = 0, j = n - 1; i < n; j = i++) {
@@ -802,29 +853,33 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
         const xj = poly[j].x;
         const yj = poly[j].y;
 
-        // checa se está sobre a aresta
         const cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
         const dot = (x - xi) * (x - xj) + (y - yi) * (y - yj);
         if (Math.abs(cross) < 1e-8 && dot <= 1e-8) {
           return true;
         }
 
-        const intersect =
-          yi > y !== yj > y &&
-          x <
-            ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
+        const intersect = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
         if (intersect) inside = !inside;
       }
       return inside;
     };
 
-    // interseções da linha vertical x = x0 com o polígono (paridade)
+    let curPillars = [...basePillars];
+    let curBeams = [...baseBeams];
+
+    const addEdge = (pa: Point3, pb: Point3) => {
+      const res = applyAddBeamBetween(pa, pb, curPillars, curBeams);
+      curPillars = res.pillars;
+      curBeams = res.beams;
+    };
+
     const verticalSegments = (x0: number) => {
       const intersections: number[] = [];
       for (let i = 0; i < n; i++) {
         const p1 = poly[i];
         const p2 = poly[(i + 1) % n];
-        if (p1.x === p2.x) continue; // evita duplicar em arestas verticais
+        if (p1.x === p2.x) continue;
         const xMin = Math.min(p1.x, p2.x);
         const xMax = Math.max(p1.x, p2.x);
         if (x0 < xMin || x0 >= xMax) continue;
@@ -836,21 +891,17 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       intersections.sort((a, b) => a - b);
       for (let k = 0; k + 1 < intersections.length; k += 2) {
         const y1 = intersections[k];
-      const y2 = intersections[k + 1];
-      addBeamBetween(
-        { x: x0, y: y1, z: 0 },
-        { x: x0, y: y2, z: 0 }
-      );
+        const y2 = intersections[k + 1];
+        addEdge({ x: x0, y: y1, z: 0 }, { x: x0, y: y2, z: 0 });
       }
     };
 
-    // interseções da linha horizontal y = y0 com o polígono (paridade)
     const horizontalSegments = (y0: number) => {
       const intersections: number[] = [];
       for (let i = 0; i < n; i++) {
         const p1 = poly[i];
         const p2 = poly[(i + 1) % n];
-        if (p1.y === p2.y) continue; // evita duplicar em arestas horizontais
+        if (p1.y === p2.y) continue;
         const yMin = Math.min(p1.y, p2.y);
         const yMax = Math.max(p1.y, p2.y);
         if (y0 < yMin || y0 >= yMax) continue;
@@ -862,41 +913,29 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       intersections.sort((a, b) => a - b);
       for (let k = 0; k + 1 < intersections.length; k += 2) {
         const x1 = intersections[k];
-      const x2 = intersections[k + 1];
-      addBeamBetween(
-        { x: x1, y: y0, z: 0 },
-        { x: x2, y: y0, z: 0 }
-      );
+        const x2 = intersections[k + 1];
+        addEdge({ x: x1, y: y0, z: 0 }, { x: x2, y: y0, z: 0 });
       }
     };
 
     xs.forEach(verticalSegments);
     ys.forEach(horizontalSegments);
 
-        // pilares exatamente nas interseções da malha
-    const newPillars: Pillar[] = [];
+    const tolAdd = 1e-4;
     xs.forEach((x) => {
       ys.forEach((y) => {
         if (pointInPoly(x, y)) {
-          newPillars.push(addPillarDirect(x, y));
+          const exists = curPillars.some((q) => Math.hypot(q.x - x, q.y - y) < tolAdd);
+          if (!exists) curPillars.push(addPillarDirect(x, y));
         }
       });
     });
 
-    setPillars((prev) => {
-      const out = [...prev];
-      const tol = 1e-4;
-      newPillars.forEach((p) => {
-        const exists = out.some(
-          (q) => Math.hypot(q.x - p.x, q.y - p.y) < tol
-        );
-        if (!exists) out.push(p);
-      });
-      cleanupOrphanBeams(out);
-      return out;
-    });
+    const enforced = enforceAutoPillars(curPillars, curBeams);
+    const refreshed = refreshBeamsFromAnchors(curBeams, enforced);
+    setPillars(enforced);
+    setBeams(refreshed);
   };
-
 
   const addPillarAt = (x: number, y: number) => {
     let newX = x;
@@ -963,9 +1002,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     auto: true,
   });
 
-  // Insere pilares automáticos quando o vão excede o máximo e remove autos redundantes
+  // Insere pilares autom?ticos dividindo v?os acima do limite e removendo autos redundantes
   const enforceAutoPillars = (pillarList: Pillar[], beamList: Beam[]) => {
-    const tolPerp = 0.02; // pequeno, mas permite achar autos na linha
+    const tolPerp = 0.02;
     const tolPos = 0.02;
     const pillarsWork: Pillar[] = [...pillarList];
     const key = (x: number, y: number) => `${x.toFixed(4)}|${y.toFixed(4)}`;
@@ -988,39 +1027,56 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       if (len < 1e-6) return;
       const useX = Math.abs(dx) >= Math.abs(dy);
       const maxSpan = useX ? maxSpanX : maxSpanY;
+      if (maxSpan <= 0) return;
       const ux = dx / len;
       const uy = dy / len;
 
-      const pillarOnBeam = (p: Pillar) => {
+      const aligned: { t: number; auto: boolean }[] = [];
+      pillarsWork.forEach((p) => {
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
-        if (t < -tolPos || t > len + tolPos) return false;
+        if (t < -tolPos || t > len + tolPos) return;
         const perp = Math.abs(vx * -uy + vy * ux);
-        return perp <= tolPerp;
-      };
+        if (perp <= tolPerp)
+          aligned.push({ t: Math.max(0, Math.min(len, t)), auto: !!p.auto });
+      });
 
-      if (maxSpan <= 0 || len <= maxSpan + tolPos) {
-        // remove autos internos desse vão
-        for (let i = pillarsWork.length - 1; i >= 0; i--) {
-          const p = pillarsWork[i];
-          if (!p.auto) continue;
-          if (!pillarOnBeam(p)) continue;
-          const t = (p.x - b.x1) * ux + (p.y - b.y1) * uy;
-          if (t <= tolPos || t >= len - tolPos) continue; // mantêm extremos
-          pillarsWork.splice(i, 1);
+      aligned.push({ t: 0, auto: false }, { t: len, auto: false });
+      aligned.sort((a, b) => a.t - b.t);
+
+      const desired: number[] = [0];
+      for (let i = 1; i < aligned.length; i++) {
+        const prevT = aligned[i - 1].t;
+        const curT = aligned[i].t;
+        desired.push(curT);
+        let cursor = prevT;
+        while (curT - cursor > maxSpan + tolPos) {
+          cursor += maxSpan;
+          if (cursor >= curT - tolPos) break;
+          const x = b.x1 + ux * cursor;
+          const y = b.y1 + uy * cursor;
+          ensureAutoAt(x, y);
+          desired.push(cursor);
         }
-        return;
       }
 
-      for (let d = maxSpan; d < len - tolPos; d += maxSpan) {
-        const x = b.x1 + ux * d;
-        const y = b.y1 + uy * d;
-        ensureAutoAt(x, y);
+      const desiredSet = new Set(desired.map((t) => Math.round(t * 10000)));
+      for (let i = pillarsWork.length - 1; i >= 0; i--) {
+        const p = pillarsWork[i];
+        if (!p.auto) continue;
+        const vx = p.x - b.x1;
+        const vy = p.y - b.y1;
+        const t = vx * ux + vy * uy;
+        if (t < -tolPos || t > len + tolPos) continue;
+        const perp = Math.abs(vx * -uy + vy * ux);
+        if (perp > tolPerp) continue;
+        const tKey = Math.round(Math.max(0, Math.min(len, t)) * 10000);
+        if (!desiredSet.has(tKey)) pillarsWork.splice(i, 1);
       }
     });
 
-    // remove autos não usados em nenhuma viga
+    // remove autos n?o usados em nenhuma viga
     const usedKeys = new Set<string>();
     beamList.forEach((b) => {
       usedKeys.add(key(b.x1, b.y1));
@@ -1259,11 +1315,25 @@ const applyDragDelta = (
         const pC: Point3 = { x: xMax, y: yMax, z: 0 };
         const pD: Point3 = { x: xMin, y: yMax, z: 0 };
 
-        addBeamBetween(pA, pB);
-        addBeamBetween(pB, pC);
-        addBeamBetween(pC, pD);
-        addBeamBetween(pD, pA);
-        generateGridInsidePolygon([pA, pB, pC, pD]);
+        let curP = [...pillars];
+        let curB = [...beams];
+        const addEdge = (pa: Point3, pb: Point3) => {
+          const res = applyAddBeamBetween(pa, pb, curP, curB);
+          curP = res.pillars;
+          curB = res.beams;
+        };
+
+        addEdge(pA, pB);
+        addEdge(pB, pC);
+        addEdge(pC, pD);
+        addEdge(pD, pA);
+
+        const enforced = enforceAutoPillars(curP, curB);
+        const refreshed = refreshBeamsFromAnchors(curB, enforced);
+        setPillars(enforced);
+        setBeams(refreshed);
+
+        generateGridInsidePolygon([pA, pB, pC, pD], enforced, refreshed);
 
         setRectTempStart(null);
         setDrawRectBeamMode(false); // desativa modo após fechar retângulo
