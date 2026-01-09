@@ -24,6 +24,9 @@ type PdfInfo = {
 
 type Point3 = { x: number; y: number; z: number };
 
+type PillarKind = "pre" | "auto" | "temp";
+type PillarState = "active" | "suspended";
+
 type Pillar = {
   id: number;
   type: "retangular" | "circular";
@@ -33,12 +36,20 @@ type Pillar = {
   width?: number;
   length?: number;
   diameter?: number;
-  auto?: boolean;
+  kind: PillarKind;
+  state?: PillarState;
+  homeX?: number;
+  homeY?: number;
+  moveClone?: boolean;
+  cloneOfId?: number;
+  suspendedBy?: number;
 };
 type Beam = {
   id: number;
   startId: number;
   endId: number;
+  originStartId?: number;
+  originEndId?: number;
   x1: number;
   y1: number;
   x2: number;
@@ -63,11 +74,25 @@ type MoveSelection = {
   current: Point3 | null;
 };
 
+type MoveSession = {
+  active: boolean;
+  cloneMap: Map<number, number>;
+  cloneOrigins: Map<number, number>;
+  bounds: { minX: number; maxX: number; minY: number; maxY: number };
+  prevClonePositions: Map<number, { x: number; y: number }>;
+};
+
 
 type OrthoView = "top" | "bottom" | "front" | "back" | "left" | "right";
 type ViewMode = "3d" | OrthoView;
 
 const POINT_TO_MM = 25.4 / 72;
+
+const isPillarActive = (p: Pillar) => p.state !== "suspended";
+const isMoveClone = (p: Pillar) => !!p.moveClone;
+const isAutoLike = (p: Pillar) =>
+  (p.kind === "auto" || p.kind === "temp") && !p.moveClone;
+const isPrePillar = (p: Pillar) => p.kind === "pre";
 
 // -------------------------------------------------------------
 // CAMERA CONTROLLER
@@ -439,6 +464,7 @@ function PillarMesh({
   onPointerMove?: (p: Point3, e: any) => void;
   isSelected?: boolean;
 }) {
+  if (!isPillarActive(pillar)) return null;
   const { x, y, type, width, length, diameter, height } = pillar;
 
   const h = height ?? 3;
@@ -597,6 +623,8 @@ const [dragInitialPositions, setDragInitialPositions] = useState<
 const dragPrevPositionsRef = useRef<Map<number, { x: number; y: number }>>(
   new Map()
 );
+const moveSessionRef = useRef<MoveSession | null>(null);
+const isClearingRef = useRef(false);
 const [editBeamWidth, setEditBeamWidth] = useState(0.15); // m
 const [editBeamHeight, setEditBeamHeight] = useState(0.3); // m (valor inicial qualquer)
 
@@ -677,6 +705,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     let best: Pillar | null = null;
     let bestD = Infinity;
     pillars.forEach((pl) => {
+      if (!isPillarActive(pl)) return;
       const d = Math.hypot(pl.x - p.x, pl.y - p.y);
       if (d < snapTol && d < bestD) {
         best = pl;
@@ -727,17 +756,22 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     p1: Point3,
     p2: Point3,
     basePillars: Pillar[] = pillars,
-    baseBeams: Beam[] = beams
+    baseBeams: Beam[] = beams,
+    createKind: PillarKind = "pre"
   ) => {
     const snapTol = 0.4;
     let working = [...basePillars];
     const findNear = (pt: Point3) =>
-      working.find((pl) => Math.hypot(pl.x - pt.x, pl.y - pt.y) <= snapTol);
+      working.find(
+        (pl) =>
+          isPillarActive(pl) &&
+          Math.hypot(pl.x - pt.x, pl.y - pt.y) <= snapTol
+      );
 
     const ensurePillar = (pt: Point3) => {
       const found = findNear(pt);
       if (found) return found;
-      const created = addPillarDirect(pt.x, pt.y);
+      const created = addPillarDirect(pt.x, pt.y, createKind);
       working.push(created);
       return created;
     };
@@ -757,6 +791,8 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       id,
       startId: a.id,
       endId: b.id,
+      originStartId: a.id,
+      originEndId: b.id,
       x1: a.x,
       y1: a.y,
       x2: b.x,
@@ -819,7 +855,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const ensureP = (x: number, y: number) => {
         const found = curP.find((pp) => Math.hypot(pp.x - x, pp.y - y) < 1e-4);
         if (found) return found;
-        const created = addPillarDirect(x, y);
+        const created = addPillarDirect(x, y, "pre");
         curP.push(created);
         return created;
       };
@@ -929,7 +965,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       ys.forEach((y) => {
         if (pointInPoly(x, y)) {
           const exists = curPillars.some((q) => Math.hypot(q.x - x, q.y - y) < tolAdd);
-          if (!exists) curPillars.push(addPillarDirect(x, y));
+          if (!exists) curPillars.push(addPillarDirect(x, y, "pre"));
         }
       });
     });
@@ -944,7 +980,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     let newX = x;
     let newY = y;
 
-    const last = pillars[pillars.length - 1];
+    const last = [...pillars].reverse().find(isPillarActive);
 
     if (last && alignMode === "horizontal") {
       newY = last.y;
@@ -952,22 +988,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       newX = last.x;
     }
 
-    const id = Date.now() + Math.random();
-
-    const base: Pillar = {
-      id,
-      type: pillarType,
-      x: newX,
-      y: newY,
-      height: pillarHeight,
-    };
-
-    if (pillarType === "retangular") {
-      base.width = pillarWidth;
-      base.length = pillarLength;
-    } else {
-      base.diameter = pillarDiameter;
-    }
+    const base = buildPillar(newX, newY, "pre");
 
     setPillars((prev) => {
       const next = [...prev, base];
@@ -975,7 +996,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     });
   };
 
-  const addPillarDirect = (x: number, y: number): Pillar => {
+  const buildPillar = (
+    x: number,
+    y: number,
+    kind: PillarKind,
+    state: PillarState = "active"
+  ): Pillar => {
     const id = Date.now() + Math.random();
     const base: Pillar = {
       id,
@@ -983,7 +1009,13 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       x,
       y,
       height: pillarHeight,
+      kind,
+      state,
     };
+    if (kind === "pre") {
+      base.homeX = x;
+      base.homeY = y;
+    }
     if (pillarType === "retangular") {
       base.width = pillarWidth;
       base.length = pillarLength;
@@ -993,17 +1025,17 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return base;
   };
 
-  const makeAutoPillar = (x: number, y: number): Pillar => ({
-    id: Date.now() + Math.random(),
-    type: pillarType,
-    x,
-    y,
-    height: pillarHeight,
-    width: pillarType === "retangular" ? pillarWidth : undefined,
-    length: pillarType === "retangular" ? pillarLength : undefined,
-    diameter: pillarType === "circular" ? pillarDiameter : undefined,
-    auto: true,
-  });
+  const addPillarDirect = (
+    x: number,
+    y: number,
+    kind: PillarKind = "auto"
+  ): Pillar => buildPillar(x, y, kind);
+
+  const makeAutoPillar = (
+    x: number,
+    y: number,
+    kind: PillarKind = "auto"
+  ): Pillar => buildPillar(x, y, kind);
 
   // Insere pilares autom?ticos dividindo v?os acima do limite e removendo autos redundantes
   const enforceAutoPillars = (pillarList: Pillar[], beamList: Beam[]) => {
@@ -1029,7 +1061,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const len = Math.hypot(dx, dy);
       if (len < 1e-6) return;
       const useX = Math.abs(dx) >= Math.abs(dy);
-      const maxSpan = useX ? maxSpanX : maxSpanY;
+      const isDiagonal = Math.abs(dx) > tolPos && Math.abs(dy) > tolPos;
+      const maxSpan = isDiagonal
+        ? Math.max(maxSpanX, maxSpanY)
+        : useX
+          ? maxSpanX
+          : maxSpanY;
       if (maxSpan <= 0) return;
       const ux = dx / len;
       const uy = dy / len;
@@ -1042,7 +1079,10 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
         if (t < -tolPos || t > len + tolPos) return;
         const perp = Math.abs(vx * -uy + vy * ux);
         if (perp <= tolPerp)
-          aligned.push({ t: Math.max(0, Math.min(len, t)), auto: !!p.auto });
+          aligned.push({
+            t: Math.max(0, Math.min(len, t)),
+            auto: isAutoLike(p),
+          });
       });
 
       aligned.push({ t: 0, auto: false }, { t: len, auto: false });
@@ -1067,7 +1107,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const desiredSet = new Set(desired.map((t) => Math.round(t * 10000)));
       for (let i = pillarsWork.length - 1; i >= 0; i--) {
         const p = pillarsWork[i];
-        if (!p.auto) continue;
+        if (!isAutoLike(p)) continue;
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
@@ -1100,17 +1140,282 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       });
     });
 
-    return pillarsWork.filter((p) => !p.auto || usedKeys.has(key(p.x, p.y)));
+    return pillarsWork.filter(
+      (p) => !isAutoLike(p) || usedKeys.has(key(p.x, p.y))
+    );
   };
 
   const roundCoord = (v: number) => Math.round(v * 10000) / 10000;
   const coordKey = (v: number) => roundCoord(v).toFixed(4);
+  const getPillarHome = (p: Pillar) => ({
+    x: p.homeX ?? p.x,
+    y: p.homeY ?? p.y,
+  });
+  const crossesOnPath = (
+    prev: { x: number; y: number },
+    next: { x: number; y: number },
+    target: { x: number; y: number }
+  ) => {
+    const prevX = roundCoord(prev.x);
+    const prevY = roundCoord(prev.y);
+    const nextX = roundCoord(next.x);
+    const nextY = roundCoord(next.y);
+    const tgtX = roundCoord(target.x);
+    const tgtY = roundCoord(target.y);
+
+    if (prevX === nextX && prevY === nextY) return false;
+
+    if (moveAllowX && !moveAllowY) {
+      if (prevY !== nextY || tgtY !== prevY) return false;
+      const minX = Math.min(prevX, nextX);
+      const maxX = Math.max(prevX, nextX);
+      return tgtX >= minX && tgtX <= maxX;
+    }
+
+    if (moveAllowY && !moveAllowX) {
+      if (prevX !== nextX || tgtX !== prevX) return false;
+      const minY = Math.min(prevY, nextY);
+      const maxY = Math.max(prevY, nextY);
+      return tgtY >= minY && tgtY <= maxY;
+    }
+
+    const dx = roundCoord(nextX - prevX);
+    const dy = roundCoord(nextY - prevY);
+    const vx = roundCoord(tgtX - prevX);
+    const vy = roundCoord(tgtY - prevY);
+    const cross = roundCoord(vx * dy - vy * dx);
+    if (cross !== 0) return false;
+    const dot = vx * dx + vy * dy;
+    if (dot < 0) return false;
+    const lenSq = dx * dx + dy * dy;
+    if (dot > lenSq) return false;
+    return true;
+  };
+
+  const ensureBeamOrigins = (beamList: Beam[]) =>
+    beamList.map((b) => ({
+      ...b,
+      originStartId: b.originStartId ?? b.startId,
+      originEndId: b.originEndId ?? b.endId,
+    }));
+
+  const computeBounds = (pillarList: Pillar[]) => {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    pillarList.forEach((p) => {
+      if (!isPillarActive(p)) return;
+      minX = Math.min(minX, p.x);
+      maxX = Math.max(maxX, p.x);
+      minY = Math.min(minY, p.y);
+      maxY = Math.max(maxY, p.y);
+    });
+    if (!isFinite(minX)) {
+      return { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+    }
+    return { minX, maxX, minY, maxY };
+  };
+
+  const remapBeamsForSuspension = (
+    beamList: Beam[],
+    originalId: number,
+    cloneId: number
+  ) =>
+    beamList.map((b) => {
+      const originStartId = b.originStartId ?? b.startId;
+      const originEndId = b.originEndId ?? b.endId;
+      let startId = b.startId;
+      let endId = b.endId;
+      if (originStartId === originalId) startId = cloneId;
+      if (originEndId === originalId) endId = cloneId;
+      return {
+        ...b,
+        startId,
+        endId,
+        originStartId,
+        originEndId,
+      };
+    });
+
+  const getExpansionInfo = (
+    original: Pillar,
+    clone: Pillar,
+    bounds: { minX: number; maxX: number; minY: number; maxY: number },
+    tol = 1e-4
+  ) => {
+    const home = getPillarHome(original);
+    const onLeft = Math.abs(home.x - bounds.minX) <= tol;
+    const onRight = Math.abs(home.x - bounds.maxX) <= tol;
+    const onBottom = Math.abs(home.y - bounds.minY) <= tol;
+    const onTop = Math.abs(home.y - bounds.maxY) <= tol;
+    const expandX =
+      (onLeft && clone.x < bounds.minX - tol) ||
+      (onRight && clone.x > bounds.maxX + tol);
+    const expandY =
+      (onBottom && clone.y < bounds.minY - tol) ||
+      (onTop && clone.y > bounds.maxY + tol);
+    return {
+      expanding: expandX || expandY,
+      expandX,
+      expandY,
+      onLeft,
+      onRight,
+      onBottom,
+      onTop,
+    };
+  };
+
+  const ensureExpansionBeams = (
+    beamList: Beam[],
+    pillarList: Pillar[],
+    session: MoveSession
+  ) => {
+    const byId = new Map<number, Pillar>(
+      pillarList.map((p) => [p.id, p])
+    );
+    const beamKey = (a: number, b: number) =>
+      `${Math.min(a, b)}|${Math.max(a, b)}`;
+    const existing = new Set<string>(
+      beamList.map((b) => beamKey(b.startId, b.endId))
+    );
+    const expansionSet = new Set<string>();
+    const expansionPairs: Array<[number, number]> = [];
+    const getNeighbors = (originalId: number) => {
+      const neighbors = new Set<number>();
+      beamList.forEach((b) => {
+        const os = b.originStartId ?? b.startId;
+        const oe = b.originEndId ?? b.endId;
+        if (os === originalId) neighbors.add(oe);
+        if (oe === originalId) neighbors.add(os);
+      });
+      return Array.from(neighbors);
+    };
+
+    let nextBeams = [...beamList];
+
+    const markExpansion = (aId: number, bId: number) => {
+      const key = beamKey(aId, bId);
+      if (expansionSet.has(key)) return;
+      expansionSet.add(key);
+      expansionPairs.push([aId, bId]);
+    };
+
+    session.cloneMap.forEach((cloneId, originalId) => {
+      const original = byId.get(originalId);
+      const clone = byId.get(cloneId);
+      if (!original || !clone) return;
+      const info = getExpansionInfo(original, clone, session.bounds);
+      if (!info.expanding) return;
+
+      const addBeam = (aId: number, bId: number, isExpansion = false) => {
+        if (aId === bId) return;
+        const key = beamKey(aId, bId);
+        if (isExpansion) markExpansion(aId, bId);
+        if (existing.has(key)) return;
+        const a = byId.get(aId);
+        const c = byId.get(bId);
+        if (!a || !c) return;
+        const dx = c.x - a.x;
+        const dy = c.y - a.y;
+        const span = Math.hypot(dx, dy);
+        if (span < 1e-6) return;
+        const width = 0.15;
+        const height = span / 10;
+        nextBeams.push({
+          id: Date.now() + Math.random(),
+          startId: aId,
+          endId: bId,
+          originStartId: aId,
+          originEndId: bId,
+          x1: a.x,
+          y1: a.y,
+          x2: c.x,
+          y2: c.y,
+          width,
+          height,
+        });
+        existing.add(key);
+      };
+
+      addBeam(originalId, cloneId, true);
+
+      const neighbors = getNeighbors(originalId);
+      neighbors.forEach((neighborId) => {
+        if (neighborId === cloneId) return;
+        const neighborCloneId = session.cloneMap.get(neighborId);
+        if (neighborCloneId != null) {
+          addBeam(neighborCloneId, cloneId, true);
+          return;
+        }
+        const neighbor = byId.get(neighborId);
+        if (!neighbor || !isPillarActive(neighbor)) return;
+        const dx = neighbor.x - original.x;
+        const dy = neighbor.y - original.y;
+        const absDx = Math.abs(dx);
+        const absDy = Math.abs(dy);
+        let use = false;
+        if (info.expandX && !info.expandY) use = absDy >= absDx;
+        else if (info.expandY && !info.expandX) use = absDx >= absDy;
+        else use = absDx + absDy > 0;
+        if (!use) return;
+        addBeam(neighborId, cloneId, true);
+      });
+    });
+
+    return { beams: nextBeams, expansionPairs };
+  };
+
+  const ensureExpansionAutoPillars = (
+    pillarList: Pillar[],
+    beamList: Beam[],
+    expansionPairs: Array<[number, number]>
+  ) => {
+    if (expansionPairs.length === 0) return pillarList;
+    const tolPos = 0.02;
+    const beamKey = (a: number, b: number) =>
+      `${Math.min(a, b)}|${Math.max(a, b)}`;
+    const beamByKey = new Map<string, Beam>();
+    beamList.forEach((b) => {
+      beamByKey.set(beamKey(b.startId, b.endId), b);
+    });
+    const next = [...pillarList];
+    const findAt = (x: number, y: number) =>
+      next.find((p) => Math.hypot(p.x - x, p.y - y) <= tolPos);
+
+    expansionPairs.forEach(([aId, bId]) => {
+      const beam = beamByKey.get(beamKey(aId, bId));
+      if (!beam) return;
+      const dx = beam.x2 - beam.x1;
+      const dy = beam.y2 - beam.y1;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) return;
+      const useX = Math.abs(dx) >= Math.abs(dy);
+      const isDiagonal = Math.abs(dx) > tolPos && Math.abs(dy) > tolPos;
+      const maxSpan = isDiagonal
+        ? Math.max(maxSpanX, maxSpanY)
+        : useX
+          ? maxSpanX
+          : maxSpanY;
+      if (maxSpan <= 0) return;
+      const ux = dx / len;
+      const uy = dy / len;
+      for (let t = maxSpan; t < len - tolPos; t += maxSpan) {
+        const x = beam.x1 + ux * t;
+        const y = beam.y1 + uy * t;
+        if (findAt(x, y)) continue;
+        next.push(makeAutoPillar(x, y));
+      }
+    });
+
+    return next;
+  };
 
   const isPillarOnBeam = (
     p: Pillar,
     b: Beam,
-    tolPos = 1e-4,
-    tolPerp = 1e-4
+    tolPos = 0.02,
+    tolPerp = 0.02
   ) => {
     const dx = b.x2 - b.x1;
     const dy = b.y2 - b.y1;
@@ -1130,15 +1435,15 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     beams.some((b) => isPillarOnBeam(p, b));
 
   const pruneAutoOrphans = (pillarList: Pillar[], beams: Beam[]) =>
-    pillarList.filter((p) => !p.auto || isPillarOnAnyBeam(p, beams));
+    pillarList.filter((p) => !isAutoLike(p) || isPillarOnAnyBeam(p, beams));
 
   const recalcPillarsForMove = (
     pillarList: Pillar[],
     beamList: Beam[],
     allBeams: Beam[]
   ) => {
-    const tolPerp = 1e-4;
-    const tolPos = 1e-4;
+    const tolPerp = 0.02;
+    const tolPos = 0.02;
     const next: Pillar[] = [...pillarList];
     const required = new Set<string>();
 
@@ -1152,7 +1457,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const len = Math.hypot(dx, dy);
       if (len < 1e-6) return;
       const useX = Math.abs(dx) >= Math.abs(dy);
-      const maxSpan = useX ? maxSpanX : maxSpanY;
+      const isDiagonal = Math.abs(dx) > tolPos && Math.abs(dy) > tolPos;
+      const maxSpan = isDiagonal
+        ? Math.max(maxSpanX, maxSpanY)
+        : useX
+          ? maxSpanX
+          : maxSpanY;
       const ux = dx / len;
       const uy = dy / len;
 
@@ -1168,7 +1478,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
         const y = b.y1 + uy * t;
         const k = key(x, y);
         required.add(k);
-        if (!findAt(x, y)) next.push(makeAutoPillar(x, y));
+        if (!findAt(x, y)) next.push(makeAutoPillar(x, y, "temp"));
       });
     });
 
@@ -1182,8 +1492,419 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       if (required.has(k)) return true;
       if (otherBeams.some((b) => isPillarOnBeam(p, b, tolPos, tolPerp)))
         return true;
-      return false;
+      return !isAutoLike(p);
     });
+  };
+
+  const restoreBeamAnchors = (beamList: Beam[], pillarList: Pillar[]) => {
+    const activeIds = new Set(
+      pillarList.filter(isPillarActive).map((p) => p.id)
+    );
+    return beamList.map((b) => {
+        const originStartId = b.originStartId ?? b.startId;
+        const originEndId = b.originEndId ?? b.endId;
+        const startId = activeIds.has(originStartId)
+          ? originStartId
+          : b.startId;
+        const endId = activeIds.has(originEndId) ? originEndId : b.endId;
+        if (
+          startId === b.startId &&
+          endId === b.endId &&
+          originStartId === b.originStartId &&
+          originEndId === b.originEndId
+        ) {
+          return b;
+        }
+        return {
+          ...b,
+          startId,
+          endId,
+          originStartId,
+          originEndId,
+        };
+      });
+  };
+
+  const restoreSuspendedPrePillars = (
+    pillarList: Pillar[],
+    beamList: Beam[],
+    movedIds: Set<number>,
+    options?: {
+      restoreOnEmpty?: boolean;
+      prevPositions?: Map<number, { x: number; y: number }>;
+      nextPositions?: Map<number, { x: number; y: number }>;
+      suspendedIds?: Set<number>;
+    }
+  ) => {
+    const restoreOnEmpty = options?.restoreOnEmpty ?? false;
+    const prevPositions = options?.prevPositions;
+    const nextPositions = options?.nextPositions;
+    const suspendedIds = options?.suspendedIds;
+    const nextPillars = pillarList.map((p) => ({ ...p }));
+    const posKey = (x: number, y: number) =>
+      `${coordKey(x)}|${coordKey(y)}`;
+    const activeByKey = new Map<string, Pillar>();
+    nextPillars.forEach((p) => {
+      if (!isPillarActive(p)) return;
+      activeByKey.set(posKey(p.x, p.y), p);
+    });
+
+    const remap = new Map<number, number>();
+    const removed = new Set<number>();
+    const restoredIds = new Set<number>();
+
+    nextPillars.forEach((p) => {
+      if (!isPrePillar(p)) return;
+      if (p.state !== "suspended") return;
+      if (movedIds.has(p.id)) return;
+      const home = getPillarHome(p);
+      const key = posKey(home.x, home.y);
+      const occupant = activeByKey.get(key);
+      let crossed = false;
+      if (prevPositions && nextPositions && !suspendedIds?.has(p.id)) {
+        for (const [movedId, prev] of prevPositions) {
+          const next = nextPositions.get(movedId);
+          if (!next) continue;
+          if (crossesOnPath(prev, next, home)) {
+            crossed = true;
+            break;
+          }
+        }
+      }
+
+      if (!occupant) {
+        if (restoreOnEmpty || crossed) {
+          p.x = home.x;
+          p.y = home.y;
+          p.state = "active";
+          activeByKey.set(key, p);
+          restoredIds.add(p.id);
+        }
+        return;
+      }
+
+      if (occupant.id === p.id) {
+        p.state = "active";
+        restoredIds.add(p.id);
+        return;
+      }
+
+      if (isAutoLike(occupant)) {
+        remap.set(occupant.id, p.id);
+        removed.add(occupant.id);
+        p.x = home.x;
+        p.y = home.y;
+        p.state = "active";
+        activeByKey.set(key, p);
+        restoredIds.add(p.id);
+      }
+    });
+
+    let nextBeams = beamList;
+    if (remap.size > 0) {
+      const remappedBeams = beamList.map((b) => {
+        const startId = remap.get(b.startId) ?? b.startId;
+        const endId = remap.get(b.endId) ?? b.endId;
+        if (startId === b.startId && endId === b.endId) return b;
+        return { ...b, startId, endId };
+      });
+
+      const seen = new Set<string>();
+      const uniqueBeams: Beam[] = [];
+      remappedBeams.forEach((b) => {
+        const a = Math.min(b.startId, b.endId);
+        const c = Math.max(b.startId, b.endId);
+        const k = `${a}|${c}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        uniqueBeams.push(b);
+      });
+      nextBeams = uniqueBeams;
+    }
+
+    const filteredPillars =
+      removed.size > 0
+        ? nextPillars.filter((p) => !removed.has(p.id))
+        : nextPillars;
+
+    return { pillars: filteredPillars, beams: nextBeams, restoredIds };
+  };
+
+  const updateMovedPillarHomes = (
+    pillarList: Pillar[],
+    movedIds: Set<number>
+  ) =>
+    pillarList.map((p) => {
+      if (!isPrePillar(p)) return p;
+      if (!movedIds.has(p.id)) return p;
+      if (!isPillarActive(p)) return p;
+      return { ...p, homeX: p.x, homeY: p.y };
+    });
+
+  const normalizeTempPillars = (pillarList: Pillar[], beamList: Beam[]) =>
+    pillarList
+      .map((p) => {
+        if (p.kind !== "temp") return p;
+        if (!isPillarOnAnyBeam(p, beamList)) return null;
+        return { ...p, kind: "auto" };
+      })
+      .filter((p): p is Pillar => p != null);
+
+  const startMoveSession = (targetIds: Set<number>) => {
+    if (moveSessionRef.current?.active) return moveSessionRef.current;
+    const activeTargets = Array.from(targetIds).filter((id) => {
+      const p = pillars.find((pp) => pp.id === id);
+      return p && isPillarActive(p) && !isMoveClone(p);
+    });
+    if (activeTargets.length === 0) return null;
+
+    const bounds = computeBounds(pillars);
+    let nextPillars = pillars.map((p) => ({ ...p }));
+    let nextBeams = ensureBeamOrigins(beams);
+    const cloneMap = new Map<number, number>();
+    const cloneOrigins = new Map<number, number>();
+    const prevClonePositions = new Map<number, { x: number; y: number }>();
+
+    activeTargets.forEach((id) => {
+      const index = nextPillars.findIndex((p) => p.id === id);
+      if (index === -1) return;
+      const original = nextPillars[index];
+      const cloneId = Date.now() + Math.random();
+      const clone: Pillar = {
+        ...original,
+        id: cloneId,
+        kind: "temp",
+        state: "active",
+        moveClone: true,
+        cloneOfId: original.id,
+        homeX: undefined,
+        homeY: undefined,
+      };
+      cloneMap.set(original.id, cloneId);
+      cloneOrigins.set(cloneId, original.id);
+      prevClonePositions.set(cloneId, { x: clone.x, y: clone.y });
+      nextPillars[index] = {
+        ...original,
+        state: "suspended",
+        suspendedBy: cloneId,
+      };
+      nextPillars.push(clone);
+      nextBeams = remapBeamsForSuspension(nextBeams, original.id, cloneId);
+    });
+
+    if (cloneMap.size === 0) return null;
+
+    moveSessionRef.current = {
+      active: true,
+      cloneMap,
+      cloneOrigins,
+      bounds,
+      prevClonePositions,
+    };
+    setPillars(nextPillars);
+    setBeams(nextBeams);
+    const cloneIds = Array.from(cloneOrigins.keys());
+    setSelectedPillarIds(cloneIds);
+    setSelectedPillarId(cloneIds[0] ?? null);
+    return moveSessionRef.current;
+  };
+
+  const applyMoveDeltaWithSession = (
+    dx: number,
+    dy: number,
+    origins: Map<number, { x: number; y: number }>,
+    finalize = false
+  ) => {
+    const session = moveSessionRef.current;
+    if (!session || !session.active) return;
+    const cloneIds = new Set<number>(session.cloneOrigins.keys());
+    const sourceOriginalIds = new Set<number>(session.cloneMap.keys());
+    let nextPillars = pillars.map((p) => ({ ...p }));
+    let nextBeams = ensureBeamOrigins(beams);
+    const byId = new Map<number, Pillar>(
+      nextPillars.map((p) => [p.id, p])
+    );
+    session.cloneOrigins.forEach((originalId, cloneId) => {
+      if (byId.has(cloneId)) return;
+      const original = byId.get(originalId);
+      if (!original) return;
+      const clone: Pillar = {
+        ...original,
+        id: cloneId,
+        kind: "temp",
+        state: "active",
+        moveClone: true,
+        cloneOfId: original.id,
+        homeX: undefined,
+        homeY: undefined,
+      };
+      nextPillars.push(clone);
+      byId.set(cloneId, clone);
+    });
+
+    const prevPositions = new Map(session.prevClonePositions);
+    const nextPositions = new Map<number, { x: number; y: number }>();
+    const originPositions = new Map<number, { x: number; y: number }>();
+
+    cloneIds.forEach((cloneId) => {
+      const clone = byId.get(cloneId);
+      if (!clone) return;
+      const origin = origins.get(cloneId) ?? { x: clone.x, y: clone.y };
+      originPositions.set(cloneId, origin);
+      clone.x = origin.x + dx;
+      clone.y = origin.y + dy;
+      nextPositions.set(cloneId, { x: clone.x, y: clone.y });
+    });
+
+    session.cloneMap.forEach((cloneId, originalId) => {
+      const original = byId.get(originalId);
+      const clone = byId.get(cloneId);
+      if (!original || !clone) return;
+      const info = getExpansionInfo(original, clone, session.bounds);
+      if (info.expanding) {
+        if (original.state === "suspended") original.state = "active";
+        original.suspendedBy = undefined;
+      } else {
+        if (original.state !== "suspended") {
+          original.state = "suspended";
+          nextBeams = remapBeamsForSuspension(nextBeams, original.id, clone.id);
+        }
+        original.suspendedBy = clone.id;
+      }
+    });
+
+    const findCoveringClone = (target: { x: number; y: number }) => {
+      for (const cloneId of cloneIds) {
+        const clone = byId.get(cloneId);
+        if (!clone) continue;
+        const origin =
+          originPositions.get(cloneId) ??
+          prevPositions.get(cloneId) ??
+          { x: clone.x, y: clone.y };
+        if (crossesOnPath(origin, { x: clone.x, y: clone.y }, target)) {
+          return cloneId;
+        }
+      }
+      return null;
+    };
+
+    nextPillars.forEach((p) => {
+      if (cloneIds.has(p.id) || sourceOriginalIds.has(p.id)) return;
+      if (isAutoLike(p)) return;
+      const target = getPillarHome(p);
+      const coveringCloneId = findCoveringClone(target);
+      if (coveringCloneId != null) {
+        if (p.state !== "suspended" || p.suspendedBy !== coveringCloneId) {
+          p.state = "suspended";
+          p.suspendedBy = coveringCloneId;
+          nextBeams = remapBeamsForSuspension(
+            nextBeams,
+            p.id,
+            coveringCloneId
+          );
+        }
+      } else if (
+        p.state === "suspended" &&
+        p.suspendedBy != null &&
+        cloneIds.has(p.suspendedBy)
+      ) {
+        p.state = "active";
+        p.suspendedBy = undefined;
+      }
+    });
+
+    nextBeams = restoreBeamAnchors(nextBeams, nextPillars);
+    const expansionResult = ensureExpansionBeams(
+      nextBeams,
+      nextPillars,
+      session
+    );
+    nextBeams = expansionResult.beams;
+    const alignedBeams = refreshBeamsFromAnchors(nextBeams, nextPillars);
+    const enforced = enforceAutoPillars(nextPillars, alignedBeams);
+    const refreshed = refreshBeamsFromAnchors(alignedBeams, enforced);
+    const cleaned = pruneAutoOrphans(enforced, refreshed);
+    const expandedPillars = ensureExpansionAutoPillars(
+      cleaned,
+      refreshed,
+      expansionResult.expansionPairs
+    );
+
+    setPillars(expandedPillars);
+    setBeams(refreshed);
+    session.prevClonePositions = nextPositions;
+
+    if (finalize) {
+      finalizeMoveSession(expandedPillars, refreshed);
+    }
+  };
+
+  const finalizeMoveSession = (
+    pillarList: Pillar[] = pillars,
+    beamList: Beam[] = beams
+  ) => {
+    const session = moveSessionRef.current;
+    if (!session || !session.active) return;
+    let nextPillars = pillarList.map((p) => ({ ...p }));
+    let nextBeams = ensureBeamOrigins(beamList);
+    const byId = new Map<number, Pillar>(
+      nextPillars.map((p) => [p.id, p])
+    );
+    const removeIds = new Set<number>();
+
+    session.cloneMap.forEach((cloneId, originalId) => {
+      const original = byId.get(originalId);
+      const clone = byId.get(cloneId);
+      if (!clone) return;
+
+      if (original && original.state === "suspended") {
+        removeIds.add(originalId);
+        clone.kind = "pre";
+        clone.state = "active";
+        clone.moveClone = false;
+        clone.cloneOfId = undefined;
+        clone.homeX = clone.x;
+        clone.homeY = clone.y;
+        nextBeams = nextBeams.map((b) => {
+          const originStartId = b.originStartId ?? b.startId;
+          const originEndId = b.originEndId ?? b.endId;
+          let startId = b.startId;
+          let endId = b.endId;
+          const nextOriginStartId =
+            originStartId === originalId ? cloneId : originStartId;
+          const nextOriginEndId =
+            originEndId === originalId ? cloneId : originEndId;
+          if (startId === originalId) startId = cloneId;
+          if (endId === originalId) endId = cloneId;
+          return {
+            ...b,
+            startId,
+            endId,
+            originStartId: nextOriginStartId,
+            originEndId: nextOriginEndId,
+          };
+        });
+      } else {
+        clone.kind = "pre";
+        clone.state = "active";
+        clone.moveClone = false;
+        clone.cloneOfId = undefined;
+        clone.homeX = clone.x;
+        clone.homeY = clone.y;
+      }
+    });
+
+    if (removeIds.size > 0) {
+      nextPillars = nextPillars.filter((p) => !removeIds.has(p.id));
+    }
+
+    nextBeams = restoreBeamAnchors(nextBeams, nextPillars);
+    const refreshed = refreshBeamsFromAnchors(nextBeams, nextPillars);
+    setPillars(nextPillars);
+    setBeams(refreshed);
+    setSelectedPillarIds([]);
+    setSelectedPillarId(null);
+    moveSessionRef.current = null;
   };
 
   const absorbPassedPillars = (
@@ -1195,7 +1916,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     primaryMovedId: number | null
   ) => {
     if (movedIds.size === 0) {
-      return { pillars: pillarList, beams: beamList, movedIds };
+      return {
+        pillars: pillarList,
+        beams: beamList,
+        movedIds,
+        suspendedIds: new Set<number>(),
+      };
     }
 
     const remap = new Map<number, number>();
@@ -1204,52 +1930,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       order.push(primaryMovedId);
     }
 
-    const crossesOnPath = (
-      prev: { x: number; y: number },
-      next: { x: number; y: number },
-      target: Pillar
-    ) => {
-      const prevX = roundCoord(prev.x);
-      const prevY = roundCoord(prev.y);
-      const nextX = roundCoord(next.x);
-      const nextY = roundCoord(next.y);
-      const tgtX = roundCoord(target.x);
-      const tgtY = roundCoord(target.y);
-
-      if (prevX === nextX && prevY === nextY) return false;
-
-      if (moveAllowX && !moveAllowY) {
-        if (prevY !== nextY || tgtY !== prevY) return false;
-        const minX = Math.min(prevX, nextX);
-        const maxX = Math.max(prevX, nextX);
-        return tgtX >= minX && tgtX <= maxX;
-      }
-
-      if (moveAllowY && !moveAllowX) {
-        if (prevX !== nextX || tgtX !== prevX) return false;
-        const minY = Math.min(prevY, nextY);
-        const maxY = Math.max(prevY, nextY);
-        return tgtY >= minY && tgtY <= maxY;
-      }
-
-      const dx = roundCoord(nextX - prevX);
-      const dy = roundCoord(nextY - prevY);
-      const vx = roundCoord(tgtX - prevX);
-      const vy = roundCoord(tgtY - prevY);
-      const cross = roundCoord(vx * dy - vy * dx);
-      if (cross !== 0) return false;
-      const dot = vx * dx + vy * dy;
-      if (dot < 0) return false;
-      const lenSq = dx * dx + dy * dy;
-      if (dot > lenSq) return false;
-      return true;
-    };
-
     order.forEach((movedId) => {
       const prev = prevPositions.get(movedId);
       const next = nextPositions.get(movedId);
       if (!prev || !next) return;
       pillarList.forEach((p) => {
+        if (!isPillarActive(p)) return;
         if (p.id === movedId) return;
         if (movedIds.has(p.id)) return;
         if (remap.has(p.id)) return;
@@ -1261,17 +1947,20 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     });
 
     if (remap.size === 0) {
-      return { pillars: pillarList, beams: beamList, movedIds };
+      return {
+        pillars: pillarList,
+        beams: beamList,
+        movedIds,
+        suspendedIds: new Set<number>(),
+      };
     }
 
-    const remappedBeams = beamList
-      .map((b) => {
-        const startId = remap.get(b.startId) ?? b.startId;
-        const endId = remap.get(b.endId) ?? b.endId;
-        if (startId === b.startId && endId === b.endId) return b;
-        return { ...b, startId, endId };
-      })
-      .filter((b) => b.startId !== b.endId);
+    const remappedBeams = beamList.map((b) => {
+      const startId = remap.get(b.startId) ?? b.startId;
+      const endId = remap.get(b.endId) ?? b.endId;
+      if (startId === b.startId && endId === b.endId) return b;
+      return { ...b, startId, endId };
+    });
 
     const seen = new Set<string>();
     const uniqueBeams: Beam[] = [];
@@ -1284,11 +1973,27 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       uniqueBeams.push(b);
     });
 
-    const nextPillars = pillarList.filter((p) => !remap.has(p.id));
+    const suspendedIds = new Set<number>();
+    const nextPillars = pillarList
+      .map((p) => {
+        if (!remap.has(p.id)) return p;
+        if (isPrePillar(p)) {
+          if (p.state === "suspended") return p;
+          suspendedIds.add(p.id);
+          return { ...p, state: "suspended" };
+        }
+        return null;
+      })
+      .filter((p): p is Pillar => p != null);
     const nextMoved = new Set(
       Array.from(movedIds).map((id) => remap.get(id) ?? id)
     );
-    return { pillars: nextPillars, beams: uniqueBeams, movedIds: nextMoved };
+    return {
+      pillars: nextPillars,
+      beams: uniqueBeams,
+      movedIds: nextMoved,
+      suspendedIds,
+    };
   };
 
   const mergeOverlappingPillars = (
@@ -1300,12 +2005,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const groups = new Map<string, Pillar[]>();
     const posKey = (x: number, y: number) => `${coordKey(x)}|${coordKey(y)}`;
     pillarList.forEach((p) => {
+      if (!isPillarActive(p)) return;
       const k = posKey(p.x, p.y);
       if (!groups.has(k)) groups.set(k, []);
       groups.get(k)!.push(p);
     });
 
     const remap = new Map<number, number>();
+    const suspend = new Set<number>();
     groups.forEach((group) => {
       if (group.length < 2) return;
       let winner: Pillar | undefined;
@@ -1318,9 +2025,16 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
           winner = movedGroup.sort((a, b) => a.id - b.id)[movedGroup.length - 1];
         }
       }
+      if (!winner) {
+        const preGroup = group.filter((p) => isPrePillar(p));
+        if (preGroup.length) winner = preGroup[0];
+      }
       if (!winner) winner = group[0];
       group.forEach((p) => {
-        if (p.id !== winner!.id) remap.set(p.id, winner!.id);
+        if (p.id !== winner!.id) {
+          remap.set(p.id, winner!.id);
+          if (isPrePillar(p)) suspend.add(p.id);
+        }
       });
     });
 
@@ -1328,14 +2042,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       return { pillars: pillarList, beams: beamList, movedIds };
     }
 
-    const remappedBeams = beamList
-      .map((b) => {
-        const startId = remap.get(b.startId) ?? b.startId;
-        const endId = remap.get(b.endId) ?? b.endId;
-        if (startId === b.startId && endId === b.endId) return b;
-        return { ...b, startId, endId };
-      })
-      .filter((b) => b.startId !== b.endId);
+    const remappedBeams = beamList.map((b) => {
+      const startId = remap.get(b.startId) ?? b.startId;
+      const endId = remap.get(b.endId) ?? b.endId;
+      if (startId === b.startId && endId === b.endId) return b;
+      return { ...b, startId, endId };
+    });
 
     const seen = new Set<string>();
     const uniqueBeams: Beam[] = [];
@@ -1348,7 +2060,13 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       uniqueBeams.push(b);
     });
 
-    const nextPillars = pillarList.filter((p) => !remap.has(p.id));
+    const nextPillars = pillarList
+      .map((p) => {
+        if (!remap.has(p.id)) return p;
+        if (suspend.has(p.id)) return { ...p, state: "suspended" };
+        return null;
+      })
+      .filter((p): p is Pillar => p != null);
     const nextMoved = new Set(
       Array.from(movedIds).map((id) => remap.get(id) ?? id)
     );
@@ -1380,6 +2098,17 @@ const clearAllBeams = () => {
 };
 
 const clearAllPillars = () => {
+  isClearingRef.current = true;
+  moveSessionRef.current = null;
+  setDrawBeamMode(false);
+  setDrawRectBeamMode(false);
+  setDrawPolylineMode(false);
+  setBeamTempStart(null);
+  setRectTempStart(null);
+  setPolyPoints([]);
+  setInsertMode(false);
+  setDeleteMode(false);
+  setMeasureMode(false);
   setPillars([]);
   setSelectedPillarId(null);
   setSelectedPillarIds([]);
@@ -1387,6 +2116,16 @@ const clearAllPillars = () => {
   setSelectedBeamId(null);
   setSelectedBeamSegment(null);
   setMoveSelection({ start: null, current: null });
+  setMoveMode(false);
+  setIsDraggingPillars(false);
+  setDragStartPoint(null);
+  setDragInitialPositions(new Map());
+  dragPrevPositionsRef.current = new Map();
+  setTimeout(() => {
+    setPillars([]);
+    setBeams([]);
+    isClearingRef.current = false;
+  }, 0);
 };
 
 const applyBeamEdits = () => {
@@ -1421,16 +2160,28 @@ const handlePillarClick = (id: number) => {
 };
 
 const handlePillarPointerDown = (pillar: Pillar, e: any) => {
+  if (isClearingRef.current) return;
   if (!moveMode || e?.nativeEvent?.buttons !== 1) return;
-  const ids = new Set<number>(selectedPillarIds);
-  if (selectedPillarId != null) ids.add(selectedPillarId);
+  const activeIds = new Set(
+    pillars.filter((p) => isPillarActive(p) && !isMoveClone(p)).map((p) => p.id)
+  );
+  const ids = new Set<number>(
+    selectedPillarIds.filter((id) => activeIds.has(id))
+  );
+  if (selectedPillarId != null && activeIds.has(selectedPillarId))
+    ids.add(selectedPillarId);
   ids.add(pillar.id);
-  const idsArr = Array.from(ids);
-  setSelectedPillarIds(idsArr);
-  setSelectedPillarId(pillar.id);
+  const session = startMoveSession(ids);
+  if (!session) return;
   const origins = new Map<number, { x: number; y: number }>();
-  pillars.forEach((pp) => {
-    if (ids.has(pp.id)) origins.set(pp.id, { x: pp.x, y: pp.y });
+  session.cloneOrigins.forEach((_origId, cloneId) => {
+    const clone = pillars.find((p) => p.id === cloneId);
+    if (clone) {
+      origins.set(cloneId, { x: clone.x, y: clone.y });
+    } else {
+      const prev = session.prevClonePositions.get(cloneId);
+      if (prev) origins.set(cloneId, prev);
+    }
   });
   dragPrevPositionsRef.current = new Map(origins);
   const p = e.point;
@@ -1453,61 +2204,34 @@ const handleBeamClick = (item: Beam | BeamSegment) => {
   }
 };
 
-  const movePillarsBy = (dx: number, dy: number) => {
-    const adjDx = moveAllowX ? dx : 0;
+const movePillarsBy = (dx: number, dy: number) => {
+  if (isClearingRef.current) return;
+  const adjDx = moveAllowX ? dx : 0;
     const adjDy = moveAllowY ? dy : 0;
-    const targets = new Set<number>(selectedPillarIds);
-    if (selectedPillarId != null) targets.add(selectedPillarId);
-    if (targets.size === 0) return;
-
-    const prevPositions = new Map<number, { x: number; y: number }>();
-    pillars.forEach((p) => {
-      if (targets.has(p.id)) prevPositions.set(p.id, { x: p.x, y: p.y });
+    const activeIds = new Set(
+      pillars.filter(isPillarActive).map((p) => p.id)
+    );
+    const targets = new Set<number>(
+      selectedPillarIds.filter((id) => activeIds.has(id))
+    );
+    if (selectedPillarId != null && activeIds.has(selectedPillarId))
+      targets.add(selectedPillarId);
+    const session =
+      moveSessionRef.current?.active && moveSessionRef.current
+        ? moveSessionRef.current
+        : startMoveSession(targets);
+    if (!session) return;
+    const origins = new Map<number, { x: number; y: number }>();
+    session.cloneOrigins.forEach((_origId, cloneId) => {
+      const clone = pillars.find((p) => p.id === cloneId);
+      if (clone) {
+        origins.set(cloneId, { x: clone.x, y: clone.y });
+      } else {
+        const prev = session.prevClonePositions.get(cloneId);
+        if (prev) origins.set(cloneId, prev);
+      }
     });
-
-    const newPillars = pillars.map((p) =>
-      targets.has(p.id) ? { ...p, x: p.x + adjDx, y: p.y + adjDy } : p
-    );
-    const nextPositions = new Map<number, { x: number; y: number }>();
-    newPillars.forEach((p) => {
-      if (targets.has(p.id)) nextPositions.set(p.id, { x: p.x, y: p.y });
-    });
-
-    const recalculated = refreshBeamsFromAnchors(beams, newPillars).filter(
-      (b) => beamHasPillar(b, newPillars)
-    );
-
-    const absorbed = absorbPassedPillars(
-      newPillars,
-      recalculated,
-      targets,
-      prevPositions,
-      nextPositions,
-      selectedPillarId
-    );
-
-    const merged = mergeOverlappingPillars(
-      absorbed.pillars,
-      absorbed.beams,
-      absorbed.movedIds,
-      selectedPillarId
-    );
-    const mergedBeams = refreshBeamsFromAnchors(
-      merged.beams,
-      merged.pillars
-    ).filter((b) => beamHasPillar(b, merged.pillars));
-
-    const affectedBeams = mergedBeams.filter(
-      (b) => merged.movedIds.has(b.startId) || merged.movedIds.has(b.endId)
-    );
-    const adjusted = recalcPillarsForMove(
-      merged.pillars,
-      affectedBeams,
-      mergedBeams
-    );
-    const cleaned = pruneAutoOrphans(adjusted, mergedBeams);
-    setPillars(cleaned);
-    setBeams(refreshBeamsFromAnchors(mergedBeams, cleaned));
+    applyMoveDeltaWithSession(adjDx, adjDy, origins, true);
   };
 
 const applyDragDelta = (
@@ -1515,77 +2239,46 @@ const applyDragDelta = (
   dy: number,
   origins: Map<number, { x: number; y: number }>
 ) => {
+  if (isClearingRef.current) return;
   const adjDx = moveAllowX ? dx : 0;
   const adjDy = moveAllowY ? dy : 0;
-  const targets = new Set<number>(Array.from(origins.keys()));
-  const prevPositions =
-    dragPrevPositionsRef.current.size > 0
-      ? dragPrevPositionsRef.current
-      : new Map(origins);
-  const newPillars = pillars.map((p) => {
-    const origin = origins.get(p.id);
-    if (!origin) return p;
-    return { ...p, x: origin.x + adjDx, y: origin.y + adjDy };
-  });
-  const nextPositions = new Map<number, { x: number; y: number }>();
-  newPillars.forEach((p) => {
-    if (targets.has(p.id)) nextPositions.set(p.id, { x: p.x, y: p.y });
-  });
-
-  const newBeams = refreshBeamsFromAnchors(beams, newPillars).filter((b) =>
-    beamHasPillar(b, newPillars)
-  );
-
-  const absorbed = absorbPassedPillars(
-    newPillars,
-    newBeams,
-    targets,
-    prevPositions,
-    nextPositions,
-    selectedPillarId
-  );
-
-  const merged = mergeOverlappingPillars(
-    absorbed.pillars,
-    absorbed.beams,
-    absorbed.movedIds,
-    selectedPillarId
-  );
-  const mergedBeams = refreshBeamsFromAnchors(
-    merged.beams,
-    merged.pillars
-  ).filter((b) => beamHasPillar(b, merged.pillars));
-
-  const affectedBeams = mergedBeams.filter(
-    (b) => merged.movedIds.has(b.startId) || merged.movedIds.has(b.endId)
-  );
-  const adjusted = recalcPillarsForMove(
-    merged.pillars,
-    affectedBeams,
-    mergedBeams
-  );
-  const cleaned = pruneAutoOrphans(adjusted, mergedBeams);
-  setPillars(cleaned);
-  setBeams(refreshBeamsFromAnchors(mergedBeams, cleaned));
-  const nextPrev = new Map<number, { x: number; y: number }>();
-  merged.movedIds.forEach((id) => {
-    const p = cleaned.find((pp) => pp.id === id);
-    if (p) nextPrev.set(id, { x: p.x, y: p.y });
-  });
-  dragPrevPositionsRef.current = nextPrev;
+  applyMoveDeltaWithSession(adjDx, adjDy, origins, false);
 };
 
   const handlePlaneClick = (p: Point3, e?: any) => {
+  if (isClearingRef.current) return;
   if (
     moveMode &&
     (selectedPillarIds.length > 0 || selectedPillarId != null) &&
     e?.nativeEvent?.buttons === 1
   ) {
-    const ids = new Set<number>([...selectedPillarIds]);
-    if (selectedPillarId != null) ids.add(selectedPillarId);
+    let session = moveSessionRef.current?.active
+      ? moveSessionRef.current
+      : null;
+    if (!session) {
+      const activeIds = new Set(
+        pillars
+          .filter((pp) => isPillarActive(pp) && !isMoveClone(pp))
+          .map((pp) => pp.id)
+      );
+      const ids = new Set<number>(
+        selectedPillarIds.filter((id) => activeIds.has(id))
+      );
+      if (selectedPillarId != null && activeIds.has(selectedPillarId))
+        ids.add(selectedPillarId);
+      if (ids.size === 0) return;
+      session = startMoveSession(ids);
+      if (!session) return;
+    }
     const origins = new Map<number, { x: number; y: number }>();
-    pillars.forEach((pp) => {
-      if (ids.has(pp.id)) origins.set(pp.id, { x: pp.x, y: pp.y });
+    session.cloneOrigins.forEach((_origId, cloneId) => {
+      const clone = pillars.find((pp) => pp.id === cloneId);
+      if (clone) {
+        origins.set(cloneId, { x: clone.x, y: clone.y });
+      } else {
+        const prev = session.prevClonePositions.get(cloneId);
+        if (prev) origins.set(cloneId, prev);
+      }
     });
     dragPrevPositionsRef.current = new Map(origins);
     setDragInitialPositions(origins);
@@ -1618,6 +2311,7 @@ const applyDragDelta = (
       const yMin = Math.min(moveSelection.start.y, p.y);
       const yMax = Math.max(moveSelection.start.y, p.y);
       const ids = pillars
+        .filter(isPillarActive)
         .filter(
           (pp) =>
             pp.x >= xMin && pp.x <= xMax && pp.y >= yMin && pp.y <= yMax
@@ -1748,6 +2442,7 @@ const applyDragDelta = (
   };
 
   const handlePlaneMove = (p: Point3, e?: any) => {
+    if (isClearingRef.current) return;
     if (moveMode && moveSelection.start && !isDraggingPillars) {
       setMoveSelection({ start: moveSelection.start, current: p });
     }
@@ -1760,6 +2455,7 @@ const applyDragDelta = (
 
   const handlePlaneUp = () => {
     if (!isDraggingPillars) return;
+    finalizeMoveSession();
     setIsDraggingPillars(false);
     setDragStartPoint(null);
     setDragInitialPositions(new Map());
@@ -1776,7 +2472,8 @@ const applyDragDelta = (
     ? beams.find((b) => b.id === selectedBeamId) || null
     : null;
   const selectedPillar = selectedPillarId
-    ? pillars.find((p) => p.id === selectedPillarId) || null
+    ? pillars.find((p) => p.id === selectedPillarId && isPillarActive(p)) ||
+      null
     : null;
 
   const getBeamAlignedPillars = (beam: Beam) => {
@@ -1792,6 +2489,7 @@ const applyDragDelta = (
     const margin = 0.05; // margem longitudinal (m)
 
     const candidates = pillars
+      .filter(isPillarActive)
       .map((p) => {
         const vx = p.x - x1;
         const vy = p.y - y1;
@@ -2755,6 +3453,7 @@ const applyDragDelta = (
                       setSelectedBeamId(null);
                       setSelectedBeamSegment(null);
                     } else {
+                      finalizeMoveSession();
                       setMoveSelection({ start: null, current: null });
                       setIsDraggingPillars(false);
                       setDragStartPoint(null);
