@@ -80,6 +80,7 @@ type MoveSession = {
   cloneOrigins: Map<number, number>;
   bounds: { minX: number; maxX: number; minY: number; maxY: number };
   prevClonePositions: Map<number, { x: number; y: number }>;
+  fullBorderOriginals: Set<number>;
 };
 
 
@@ -1045,7 +1046,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const key = (x: number, y: number) => `${x.toFixed(4)}|${y.toFixed(4)}`;
 
     const findAt = (x: number, y: number) =>
-      pillarsWork.find((p) => Math.hypot(p.x - x, p.y - y) <= tolPos);
+      pillarsWork.find(
+        (p) => isPillarActive(p) && Math.hypot(p.x - x, p.y - y) <= tolPos
+      );
 
     const ensureAutoAt = (x: number, y: number) => {
       const found = findAt(x, y);
@@ -1073,6 +1076,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
       const aligned: { t: number; auto: boolean }[] = [];
       pillarsWork.forEach((p) => {
+        if (!isPillarActive(p)) return;
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
@@ -1131,6 +1135,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const ux = dx / len;
       const uy = dy / len;
       pillarsWork.forEach((p) => {
+        if (!isPillarActive(p)) return;
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
@@ -1215,6 +1220,48 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       return { minX: 0, maxX: 0, minY: 0, maxY: 0 };
     }
     return { minX, maxX, minY, maxY };
+  };
+
+  const computeFullBorderOriginals = (
+    targetIds: number[],
+    pillarList: Pillar[]
+  ) => {
+    const tol = 1e-3;
+    const selected = new Set(targetIds);
+    const base = pillarList.filter(
+      (p) => isPillarActive(p) && !isAutoLike(p) && !isMoveClone(p)
+    );
+    if (base.length === 0) return new Set<number>();
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    base.forEach((p) => {
+      const x = roundCoord(p.x);
+      const y = roundCoord(p.y);
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    });
+    const collect = (match: (x: number, y: number) => boolean) =>
+      base
+        .filter((p) => match(roundCoord(p.x), roundCoord(p.y)))
+        .map((p) => p.id);
+    const borders = [
+      collect((x) => Math.abs(x - minX) <= tol),
+      collect((x) => Math.abs(x - maxX) <= tol),
+      collect((_, y) => Math.abs(y - minY) <= tol),
+      collect((_, y) => Math.abs(y - maxY) <= tol),
+    ];
+    const result = new Set<number>();
+    borders.forEach((ids) => {
+      if (ids.length === 0) return;
+      const allSelected = ids.every((id) => selected.has(id));
+      if (!allSelected) return;
+      ids.forEach((id) => result.add(id));
+    });
+    return result;
   };
 
   const remapBeamsForSuspension = (
@@ -1305,6 +1352,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const original = byId.get(originalId);
       const clone = byId.get(cloneId);
       if (!original || !clone) return;
+      if (session.fullBorderOriginals?.has(originalId)) return;
       const info = getExpansionInfo(original, clone, session.bounds);
       if (!info.expanding) return;
 
@@ -1659,6 +1707,10 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     if (activeTargets.length === 0) return null;
 
     const bounds = computeBounds(pillars);
+    const fullBorderOriginals = computeFullBorderOriginals(
+      activeTargets,
+      pillars
+    );
     let nextPillars = pillars.map((p) => ({ ...p }));
     let nextBeams = ensureBeamOrigins(beams);
     const cloneMap = new Map<number, number>();
@@ -1700,6 +1752,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       cloneOrigins,
       bounds,
       prevClonePositions,
+      fullBorderOriginals,
     };
     setPillars(nextPillars);
     setBeams(nextBeams);
@@ -1719,6 +1772,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     if (!session || !session.active) return;
     const cloneIds = new Set<number>(session.cloneOrigins.keys());
     const sourceOriginalIds = new Set<number>(session.cloneMap.keys());
+    const fullBorderOriginals = session.fullBorderOriginals;
     let nextPillars = pillars.map((p) => ({ ...p }));
     let nextBeams = ensureBeamOrigins(beams);
     const byId = new Map<number, Pillar>(
@@ -1760,6 +1814,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const original = byId.get(originalId);
       const clone = byId.get(cloneId);
       if (!original || !clone) return;
+      if (fullBorderOriginals.has(originalId)) {
+        if (original.state !== "suspended") {
+          original.state = "suspended";
+          nextBeams = remapBeamsForSuspension(nextBeams, original.id, clone.id);
+        }
+        original.suspendedBy = clone.id;
+        return;
+      }
       const info = getExpansionInfo(original, clone, session.bounds);
       if (info.expanding) {
         if (original.state === "suspended") original.state = "active";
@@ -1790,6 +1852,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
     nextPillars.forEach((p) => {
       if (cloneIds.has(p.id) || sourceOriginalIds.has(p.id)) return;
+      if (fullBorderOriginals.has(p.id)) return;
       if (isAutoLike(p)) return;
       const target = getPillarHome(p);
       const coveringCloneId = findCoveringClone(target);
@@ -1857,7 +1920,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const clone = byId.get(cloneId);
       if (!clone) return;
 
-      if (original && original.state === "suspended") {
+      const discardOriginal =
+        session.fullBorderOriginals?.has(originalId) ?? false;
+      if (discardOriginal || (original && original.state === "suspended")) {
         removeIds.add(originalId);
         clone.kind = "pre";
         clone.state = "active";
