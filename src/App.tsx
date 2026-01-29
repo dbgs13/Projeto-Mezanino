@@ -1,4 +1,4 @@
-Ôªøimport { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Canvas, useThree, useLoader } from "@react-three/fiber";
 import {
   OrbitControls,
@@ -24,8 +24,9 @@ type PdfInfo = {
 
 type Point3 = { x: number; y: number; z: number };
 
-type PillarKind = "pre" | "auto" | "temp";
+type PillarKind = "pre" | "auto" | "temp" | "anchor";
 type PillarState = "active" | "suspended";
+type AnchorRole = "free" | "support";
 
 type Pillar = {
   id: number;
@@ -43,6 +44,8 @@ type Pillar = {
   moveClone?: boolean;
   cloneOfId?: number;
   suspendedBy?: number;
+  hidden?: boolean;
+  anchorRole?: AnchorRole;
 };
 type Beam = {
   id: number;
@@ -94,6 +97,8 @@ const isMoveClone = (p: Pillar) => !!p.moveClone;
 const isAutoLike = (p: Pillar) =>
   (p.kind === "auto" || p.kind === "temp") && !p.moveClone;
 const isPrePillar = (p: Pillar) => p.kind === "pre";
+
+const isVisiblePillar = (p: Pillar) => isPillarActive(p) && !p.hidden;
 
 // -------------------------------------------------------------
 // CAMERA CONTROLLER
@@ -188,7 +193,7 @@ function CameraController({
 }
 
 // -------------------------------------------------------------
-// VIEW CUBE ‚Äì vers√£o que funcionou
+// VIEW CUBE ñ vers„o que funcionou
 // -------------------------------------------------------------
 function ViewCube({
   viewMode,
@@ -227,7 +232,7 @@ function ViewCube({
           <planeGeometry args={[0.8, 0.8]} />
           <meshBasicMaterial
             color={color}
-            depthTest={false} // n√£o "briga" com a cena
+            depthTest={false} // n„o "briga" com a cena
           />
         </mesh>
 
@@ -411,11 +416,15 @@ function BeamMesh({
   topZ,
   onClick,
   isSelected,
+  isSupportSource,
+  isSupportTarget,
 }: {
   beam: Beam | BeamSegment;
   topZ: number; // n vel do topo da viga (igual topo dos pilares)
   onClick?: () => void;
   isSelected?: boolean;
+  isSupportSource?: boolean;
+  isSupportTarget?: boolean;
 }) {
   const { x1, y1, x2, y2, width, height } = beam;
 
@@ -431,6 +440,14 @@ function BeamMesh({
   // topo da viga em topZ, centro deslocado para baixo
   const centerZ = topZ - height / 2;
 
+  const color = isSupportTarget
+    ? "#22cc88"
+    : isSupportSource
+      ? "#ff8844"
+      : isSelected
+        ? "#ffcc00"
+        : "#8888ff";
+
   return (
     <mesh
       position={[midX, midY, centerZ]}
@@ -442,7 +459,7 @@ function BeamMesh({
     >
       {/* length (ao longo da viga), width (largura da se  o), height (altura em Z) */}
       <boxGeometry args={[span, width, height]} />
-      <meshStandardMaterial color={isSelected ? "#ffcc00" : "#8888ff"} />
+      <meshStandardMaterial color={color} />
     </mesh>
   );
 }
@@ -457,6 +474,8 @@ function PillarMesh({
   onPointerUp,
   onPointerMove,
   isSelected,
+  isHoverAnchor,
+  isHoverSnap,
 }: {
   pillar: Pillar;
   onClick?: () => void;
@@ -464,13 +483,25 @@ function PillarMesh({
   onPointerUp?: () => void;
   onPointerMove?: (p: Point3, e: any) => void;
   isSelected?: boolean;
+  isHoverAnchor?: boolean;
+  isHoverSnap?: boolean;
 }) {
-  if (!isPillarActive(pillar)) return null;
+  if (!isPillarActive(pillar) || pillar.hidden) return null;
   const { x, y, type, width, length, diameter, height } = pillar;
 
   const h = height ?? 3;
   const baseZ = 0;
   const centerZ = baseZ + h / 2;
+
+  const color = isSelected
+    ? "#ffcc00"
+    : isHoverAnchor
+      ? "#ff5555"
+      : isHoverSnap
+        ? "#ffee55"
+        : type === "retangular"
+          ? "#ffaa33"
+          : "#55ccff";
 
   if (type === "retangular") {
     const w = width ?? 0.3;
@@ -498,7 +529,7 @@ function PillarMesh({
         }}
       >
         <boxGeometry args={[w, l, h]} />
-        <meshStandardMaterial color={isSelected ? "#ffcc00" : "#ffaa33"} />
+        <meshStandardMaterial color={color} />
       </mesh>
     );
   }
@@ -528,7 +559,7 @@ function PillarMesh({
       }}
     >
       <cylinderGeometry args={[radius, radius, h, 32]} />
-      <meshStandardMaterial color={isSelected ? "#ffcc00" : "#55ccff"} />
+      <meshStandardMaterial color={color} />
     </mesh>
   );
 }
@@ -560,44 +591,133 @@ function App() {
   const [pillarWidth, setPillarWidth] = useState(0.3);
   const [pillarLength, setPillarLength] = useState(0.4);
   const [pillarDiameter, setPillarDiameter] = useState(0.4);
-  // v√£os m√°ximos para gera√ß√£o autom√°tica de pilares
+  // v„os m·ximos para geraÁ„o autom·tica de pilares
   const [maxSpanX, setMaxSpanX] = useState(6); // m
   const [maxSpanY, setMaxSpanY] = useState(6); // m
 
     // VIGAS
   const [beams, setBeams] = useState<Beam[]>([]);
   const [drawBeamMode, setDrawBeamMode] = useState(false);
-  const [beamTempStart, setBeamTempStart] = useState<Point3 | null>(null);
-  // modo ret√¢ngulo de vigas (per√≠metro retangular)
+  const [beamTempStart, setBeamTempStart] = useState<{
+    point: Point3;
+    pillarId: number;
+  } | null>(null);
+  const [beamHoverPillarId, setBeamHoverPillarId] = useState<number | null>(null);
+  const [beamCantileverMode, setBeamCantileverMode] = useState(false);
+  const [supportBeamMode, setSupportBeamMode] = useState(false);
+  const [supportSourceBeamId, setSupportSourceBeamId] = useState<number | null>(null);
+  const [supportTargetBeamId, setSupportTargetBeamId] = useState<number | null>(null);
+  const [supportAngleInput, setSupportAngleInput] = useState("");
+  // modo ret‚ngulo de vigas (perÌmetro retangular)
   const [drawRectBeamMode, setDrawRectBeamMode] = useState(false);
   const [rectTempStart, setRectTempStart] = useState<Point3 | null>(null);
 
-  // modo polilinha de vigas (per√≠metro qualquer)
+  // modo polilinha de vigas (perÌmetro qualquer)
   const [drawPolylineMode, setDrawPolylineMode] = useState(false);
   const [polyPoints, setPolyPoints] = useState<Point3[]>([]);
+  const [polyPreviewPoint, setPolyPreviewPoint] = useState<Point3 | null>(null);
+  const [polyHoverPillarId, setPolyHoverPillarId] = useState<number | null>(
+    null
+  );
+  const [snapGuideX, setSnapGuideX] = useState<number | null>(null);
+  const [snapGuideY, setSnapGuideY] = useState<number | null>(null);
   const [drawAxisLock, setDrawAxisLock] = useState<"none" | "x" | "y">("none");
-  const finalizePolyline = () => {
-    if (polyPoints.length < 2) {
+  const snapPolylinePoint = (
+    target: Point3,
+    origin: Point3,
+    guideX: number | null = snapGuideX,
+    guideY: number | null = snapGuideY
+  ) => {
+    if (drawAxisLock === "x") {
+      const y = guideY != null ? guideY : target.y;
+      return { ...target, x: origin.x, y };
+    }
+    if (drawAxisLock === "y") {
+      const x = guideX != null ? guideX : target.x;
+      return { ...target, x, y: origin.y };
+    }
+    const dx = Math.abs(target.x - origin.x);
+    const dy = Math.abs(target.y - origin.y);
+    if (dx >= dy) {
+      const x = guideX != null ? guideX : target.x;
+      return { ...target, x, y: origin.y };
+    }
+    const y = guideY != null ? guideY : target.y;
+    return { ...target, x: origin.x, y };
+  };
+  const finalizePolyline = (
+    points: Point3[] = polyPoints,
+    basePillars: Pillar[] = pillars,
+    baseBeams: Beam[] = beams
+  ) => {
+    if (points.length < 2) {
       setPolyPoints([]);
       setDrawPolylineMode(false);
+      setPolyPreviewPoint(null);
+      setPolyHoverPillarId(null);
       cleanupOrphanBeams();
       return;
     }
 
-    const first = polyPoints[0];
-    const last = polyPoints[polyPoints.length - 1];
+    let curP = [...basePillars];
+    let curB = [...baseBeams];
+
+    let closedPoints = [...points];
+    const first = closedPoints[0];
+    let last = closedPoints[closedPoints.length - 1];
     const dist = Math.hypot(first.x - last.x, first.y - last.y);
 
     if (dist > 1e-6) {
-      addBeamBetween(last, first);
+      const aligned =
+        Math.abs(first.x - last.x) < 1e-6 || Math.abs(first.y - last.y) < 1e-6;
+      if (!aligned) {
+        const prev =
+          closedPoints.length >= 2
+            ? closedPoints[closedPoints.length - 2]
+            : null;
+        const prevHorizontal =
+          prev && Math.abs(prev.y - last.y) <= Math.abs(prev.x - last.x);
+        const mid: Point3 = prevHorizontal
+          ? { x: last.x, y: first.y, z: 0 }
+          : { x: first.x, y: last.y, z: 0 };
+        if (Math.hypot(mid.x - last.x, mid.y - last.y) > 1e-6) {
+          const res = applyAddBeamBetween(last, mid, curP, curB, "pre");
+          curP = res.pillars;
+          curB = res.beams;
+          closedPoints.push(mid);
+          last = mid;
+        }
+      }
+      const res = applyAddBeamBetween(last, first, curP, curB, "pre");
+      curP = res.pillars;
+      curB = res.beams;
     }
 
-    if (polyPoints.length >= 3) {
-      generateGridInsidePolygon(polyPoints);
+    if (points.length >= 3) {
+      const polyPoints =
+        dist <= 1e-6 ? closedPoints.slice(0, -1) : closedPoints;
+      const filtered = filterOutsidePolygon(polyPoints, curP, curB);
+      generateGridInsidePolygon(
+        polyPoints,
+        filtered.pillars,
+        filtered.beams,
+        "contour"
+      );
+      setPolyPoints([]);
+      setDrawPolylineMode(false);
+      setPolyPreviewPoint(null);
+      setPolyHoverPillarId(null);
+      return;
     }
 
+    const enforced = enforceAutoPillars(curP, curB);
+    const refreshed = refreshBeamsFromAnchors(curB, enforced);
+    setPillars(enforced);
+    setBeams(refreshed);
     setPolyPoints([]);
     setDrawPolylineMode(false);
+    setPolyPreviewPoint(null);
+    setPolyHoverPillarId(null);
     cleanupOrphanBeams();
   };
 
@@ -644,7 +764,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
   const isOrtho = viewMode !== "3d";
 
-  // SHIFT -> for√ßa 3D/perspectiva
+  // SHIFT -> forÁa 3D/perspectiva
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Shift") {
@@ -654,6 +774,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
+  useEffect(() => {
+    if (!drawPolylineMode) {
+      setPolyPreviewPoint(null);
+      setPolyHoverPillarId(null);
+      setSnapGuideX(null);
+      setSnapGuideY(null);
+    }
+  }, [drawPolylineMode]);
 
   const handleFileChange = async (event: any) => {
     const file = event.target.files?.[0];
@@ -701,12 +829,50 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return positions;
   };
 
+  function pointInPolygon(poly: Point3[], x: number, y: number) {
+    if (!poly || poly.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x;
+      const yi = poly[i].y;
+      const xj = poly[j].x;
+      const yj = poly[j].y;
+
+      const cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
+      const dot = (x - xi) * (x - xj) + (y - yi) * (y - yj);
+      if (Math.abs(cross) < 1e-8 && dot <= 1e-8) {
+        return true;
+      }
+
+      const intersect =
+        yi > y !== yj > y &&
+        x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  function filterOutsidePolygon(
+    poly: Point3[],
+    basePillars: Pillar[],
+    baseBeams: Beam[]
+  ) {
+    const keptPillars = basePillars.filter(
+      (p) => !pointInPolygon(poly, p.x, p.y)
+    );
+    const keptIds = new Set(keptPillars.map((p) => p.id));
+    const keptBeams = baseBeams.filter(
+      (b) => keptIds.has(b.startId) && keptIds.has(b.endId)
+    );
+    return { pillars: keptPillars, beams: keptBeams };
+  }
+
   const snapToPillarPoint = (p: Point3) => {
     const snapTol = 0.4; // 40 cm de raio para snap
     let best: Pillar | null = null;
     let bestD = Infinity;
     pillars.forEach((pl) => {
-      if (!isPillarActive(pl)) return;
+      if (!isVisiblePillar(pl)) return;
       const d = Math.hypot(pl.x - p.x, pl.y - p.y);
       if (d < snapTol && d < bestD) {
         best = pl;
@@ -716,6 +882,110 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     if (!best) return p;
     const snapped = best as Pillar;
     return { ...p, x: snapped.x, y: snapped.y };
+  };
+
+  const computeSnapGuides = (p: Point3) => {
+    const active = pillars.filter(isVisiblePillar);
+    if (active.length === 0) {
+      return { x: null, y: null };
+    }
+    const snapTol = 0.25;
+    let bestX: number | null = null;
+    let bestY: number | null = null;
+    let bestDx = snapTol + 1;
+    let bestDy = snapTol + 1;
+    active.forEach((pl) => {
+      const dx = Math.abs(pl.x - p.x);
+      if (dx <= snapTol && dx < bestDx) {
+        bestDx = dx;
+        bestX = pl.x;
+      }
+      const dy = Math.abs(pl.y - p.y);
+      if (dy <= snapTol && dy < bestDy) {
+        bestDy = dy;
+        bestY = pl.y;
+      }
+    });
+    return { x: bestX, y: bestY };
+  };
+
+  const snapToGuides = (p: Point3, guideX = snapGuideX, guideY = snapGuideY) => {
+    const x = guideX != null ? guideX : p.x;
+    const y = guideY != null ? guideY : p.y;
+    return { ...p, x, y };
+  };
+
+  const ensurePrePillarAtPoint = (
+    pt: Point3,
+    basePillars: Pillar[] = pillars
+  ) => {
+    const snapTol = 0.4;
+    const found = basePillars.find(
+      (pl) => isVisiblePillar(pl) && Math.hypot(pl.x - pt.x, pl.y - pt.y) <= snapTol
+    );
+    if (found) return { pillars: basePillars, pillar: found };
+    const created = addPillarDirect(pt.x, pt.y, "pre");
+    return { pillars: [...basePillars, created], pillar: created };
+  };
+
+  const getNearestPillar = (p: Point3, tol = 0.4): Pillar | null => {
+    let best: Pillar | null = null;
+    let bestD = tol;
+    pillars.forEach((pl) => {
+      if (!isVisiblePillar(pl)) return;
+      const d = Math.hypot(pl.x - p.x, pl.y - p.y);
+      if (d <= bestD) {
+        best = pl;
+        bestD = d;
+      }
+    });
+    return best;
+  };
+
+  const getNearestAlignedPillar = (
+    p: Point3,
+    origin: Point3,
+    tol = 0.4,
+    axisTol = 0.05
+  ): Pillar | null => {
+    const lockX = Math.abs(p.x - origin.x) < 1e-6;
+    const lockY = Math.abs(p.y - origin.y) < 1e-6;
+    if (!lockX && !lockY) return getNearestPillar(p, tol);
+    let best: Pillar | null = null;
+    let bestD = tol;
+    pillars.forEach((pl) => {
+      if (!isVisiblePillar(pl)) return;
+      if (lockX && Math.abs(pl.x - origin.x) > axisTol) return;
+      if (lockY && Math.abs(pl.y - origin.y) > axisTol) return;
+      const d = Math.hypot(pl.x - p.x, pl.y - p.y);
+      if (d <= bestD) {
+        best = pl;
+        bestD = d;
+      }
+    });
+    return best;
+  };
+
+  const getPreviewSegmentPoints = (start: Point3, end: Point3) => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-6) return [];
+    const useX = Math.abs(dx) >= Math.abs(dy);
+    const isDiagonal = Math.abs(dx) > 1e-6 && Math.abs(dy) > 1e-6;
+    const maxSpan = isDiagonal
+      ? Math.max(maxSpanX, maxSpanY)
+      : useX
+        ? maxSpanX
+        : maxSpanY;
+    if (maxSpan <= 0) return [];
+    const ux = dx / len;
+    const uy = dy / len;
+    const points: Point3[] = [];
+    for (let t = maxSpan; t < len - 1e-6; t += maxSpan) {
+      points.push({ x: start.x + ux * t, y: start.y + uy * t, z: 0 });
+    }
+    return points;
   };
 
   const buildPillarMap = (list: Pillar[]) => {
@@ -765,7 +1035,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const findNear = (pt: Point3) =>
       working.find(
         (pl) =>
-          isPillarActive(pl) &&
+          isVisiblePillar(pl) &&
           Math.hypot(pl.x - pt.x, pl.y - pt.y) <= snapTol
       );
 
@@ -813,20 +1083,370 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return { pillars: enforced, beams: refreshed };
   };
 
-  const addBeamBetween = (p1: Point3, p2: Point3) => {
-    const res = applyAddBeamBetween(p1, p2);
+  const buildBeamBetweenPillars = (
+    a: Pillar,
+    b: Pillar,
+    width = 0.15
+  ): Beam | null => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const span = Math.hypot(dx, dy);
+    if (span === 0) return null;
+    return {
+      id: Date.now() + Math.random(),
+      startId: a.id,
+      endId: b.id,
+      originStartId: a.id,
+      originEndId: b.id,
+      x1: a.x,
+      y1: a.y,
+      x2: b.x,
+      y2: b.y,
+      width,
+      height: span / 10,
+    };
+  };
+
+  const applyAddBeamBetweenPillars = (
+    a: Pillar,
+    b: Pillar,
+    basePillars: Pillar[] = pillars,
+    baseBeams: Beam[] = beams
+  ) => {
+    if (a.id === b.id) return { pillars: basePillars, beams: baseBeams };
+    const newBeam = buildBeamBetweenPillars(a, b);
+    if (!newBeam) return { pillars: basePillars, beams: baseBeams };
+    const exists = baseBeams.some(
+      (bb) =>
+        (bb.startId === newBeam.startId && bb.endId === newBeam.endId) ||
+        (bb.startId === newBeam.endId && bb.endId === newBeam.startId)
+    );
+    const nextBeams = exists ? baseBeams : [...baseBeams, newBeam];
+    const enforced = enforceAutoPillars(basePillars, nextBeams);
+    const refreshed = refreshBeamsFromAnchors(nextBeams, enforced);
+    return { pillars: enforced, beams: refreshed };
+  };
+
+  const handleBeamPointClick = (point: Point3) => {
+    setSelectedBeamId(null);
+    setSelectedPillarId(null);
+    setSelectedBeamSegment(null);
+
+    const snapped = snapToPillarPoint(point);
+    const startPoint = beamTempStart?.point ?? null;
+    let target = snapped;
+    if (startPoint) {
+      if (drawAxisLock === "x") {
+        target = { ...target, x: startPoint.x };
+      } else if (drawAxisLock === "y") {
+        target = { ...target, y: startPoint.y };
+      }
+    }
+
+    let curP = [...pillars];
+    let curB = [...beams];
+
+    const findNearest = (pt: Point3, includeHidden = false, tol = 0.4): Pillar | null => {
+      let best: Pillar | null = null;
+      let bestD = tol;
+      curP.forEach((pl) => {
+        if (!isPillarActive(pl)) return;
+        if (!includeHidden && pl.hidden) return;
+        const d = Math.hypot(pl.x - pt.x, pl.y - pt.y);
+        if (d <= bestD) {
+          best = pl;
+          bestD = d;
+        }
+      });
+      return best;
+    };
+
+    if (!beamTempStart) {
+      const existing = findNearest(target, false);
+      if (existing) {
+        setBeamTempStart({
+          point: { x: existing.x, y: existing.y, z: 0 },
+          pillarId: existing.id,
+        });
+        return;
+      }
+      const created = addPillarDirect(target.x, target.y, "pre");
+      curP.push(created);
+      setPillars(curP);
+      setBeamTempStart({
+        point: { x: created.x, y: created.y, z: 0 },
+        pillarId: created.id,
+      });
+      return;
+    }
+
+    let startPillar = curP.find((p) => p.id === beamTempStart.pillarId) ?? null;
+    if (!startPillar) {
+      const fallback = addPillarDirect(
+        beamTempStart.point.x,
+        beamTempStart.point.y,
+        "pre"
+      );
+      curP.push(fallback);
+      setPillars(curP);
+      setBeamTempStart({
+        point: { x: fallback.x, y: fallback.y, z: 0 },
+        pillarId: fallback.id,
+      });
+      return;
+    }
+
+    const endPillar =
+      findNearest(target, false) ??
+      (() => {
+        const created = beamCantileverMode
+          ? buildAnchorPillar(target.x, target.y, "free")
+          : addPillarDirect(target.x, target.y, "pre");
+        curP.push(created);
+        return created;
+      })();
+
+    const res = applyAddBeamBetweenPillars(startPillar, endPillar, curP, curB);
     setPillars(res.pillars);
     setBeams(res.beams);
+    setBeamTempStart({
+      point: { x: endPillar.x, y: endPillar.y, z: 0 },
+      pillarId: endPillar.id,
+    });
+  };
+
+  const getBeamEndpoints = (beam: Beam, map: Map<number, Pillar>) => {
+    const startP = map.get(beam.startId) || null;
+    const endP = map.get(beam.endId) || null;
+    const start = startP
+      ? { x: startP.x, y: startP.y, z: 0 }
+      : { x: beam.x1, y: beam.y1, z: 0 };
+    const end = endP
+      ? { x: endP.x, y: endP.y, z: 0 }
+      : { x: beam.x2, y: beam.y2, z: 0 };
+    return { start, end, startP, endP };
+  };
+
+  const distancePointToSegment = (p: Point3, a: Point3, b: Point3) => {
+    const vx = b.x - a.x;
+    const vy = b.y - a.y;
+    const wx = p.x - a.x;
+    const wy = p.y - a.y;
+    const lenSq = vx * vx + vy * vy;
+    if (lenSq < 1e-9) return Math.hypot(wx, wy);
+    let t = (wx * vx + wy * vy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    const projX = a.x + t * vx;
+    const projY = a.y + t * vy;
+    return Math.hypot(p.x - projX, p.y - projY);
+  };
+
+  const intersectLineWithSegment = (
+    origin: Point3,
+    dir: { x: number; y: number },
+    a: Point3,
+    b: Point3
+  ) => {
+    const sx = b.x - a.x;
+    const sy = b.y - a.y;
+    const denom = dir.x * sy - dir.y * sx;
+    if (Math.abs(denom) < 1e-8) return null;
+    const dx = a.x - origin.x;
+    const dy = a.y - origin.y;
+    const t = (dx * sy - dy * sx) / denom;
+    const u = (dx * dir.y - dy * dir.x) / denom;
+    if (u < -1e-6 || u > 1 + 1e-6) return null;
+    return { x: origin.x + t * dir.x, y: origin.y + t * dir.y, z: 0 };
+  };
+
+  const getSupportIntersection = (
+    origin: Point3,
+    supportStart: Point3,
+    supportEnd: Point3,
+    angleDeg: number | null
+  ) => {
+    const sdx = supportEnd.x - supportStart.x;
+    const sdy = supportEnd.y - supportStart.y;
+    const len = Math.hypot(sdx, sdy);
+    if (len < 1e-6) return null;
+    const baseAngle = Math.atan2(sdy, sdx);
+    const candidates: { point: Point3; dist: number }[] = [];
+    const addCandidate = (dir: { x: number; y: number }) => {
+      const hit = intersectLineWithSegment(origin, dir, supportStart, supportEnd);
+      if (!hit) return;
+      const dist = Math.hypot(hit.x - origin.x, hit.y - origin.y);
+      candidates.push({ point: hit, dist });
+    };
+    if (angleDeg != null && Math.abs(angleDeg) > 1e-6) {
+      const rad = (Math.abs(angleDeg) * Math.PI) / 180;
+      addCandidate({
+        x: Math.cos(baseAngle + rad),
+        y: Math.sin(baseAngle + rad),
+      });
+      addCandidate({
+        x: Math.cos(baseAngle - rad),
+        y: Math.sin(baseAngle - rad),
+      });
+    } else {
+      addCandidate({ x: -sdy / len, y: sdx / len });
+    }
+    if (candidates.length === 0 && angleDeg != null) {
+      addCandidate({ x: -sdy / len, y: sdx / len });
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => a.dist - b.dist);
+    return candidates[0].point;
+  };
+
+  const ensureSupportAnchorAt = (
+    pt: Point3,
+    supportBeam: Beam,
+    basePillars: Pillar[]
+  ) => {
+    const tol = 0.4;
+    let anchor = basePillars.find(
+      (p) =>
+        isPillarActive(p) &&
+        Math.hypot(p.x - pt.x, p.y - pt.y) <= tol &&
+        isPillarOnBeam(p, supportBeam)
+    );
+    let next = basePillars;
+    if (anchor) {
+      if (anchor.hidden && anchor.anchorRole !== "support") {
+        anchor = { ...anchor, anchorRole: "support" };
+        next = basePillars.map((p) => (p.id === anchor!.id ? anchor! : p));
+      }
+      return { pillars: next, pillar: anchor };
+    }
+    const created = buildAnchorPillar(pt.x, pt.y, "support");
+    return { pillars: [...basePillars, created], pillar: created };
+  };
+
+  const splitBeamAtAnchor = (
+    beam: Beam,
+    anchor: Pillar,
+    beamList: Beam[],
+    map: Map<number, Pillar>
+  ) => {
+    const data = getBeamEndpoints(beam, map);
+    const start = data.start;
+    const end = data.end;
+    const tol = 1e-4;
+    if (Math.hypot(start.x - anchor.x, start.y - anchor.y) <= tol) return beamList;
+    if (Math.hypot(end.x - anchor.x, end.y - anchor.y) <= tol) return beamList;
+    const startP = map.get(beam.startId);
+    const endP = map.get(beam.endId);
+    if (!startP || !endP) return beamList;
+    const beamA = buildBeamBetweenPillars(startP, anchor, beam.width);
+    const beamB = buildBeamBetweenPillars(anchor, endP, beam.width);
+    if (!beamA || !beamB) return beamList;
+    return beamList.filter((b) => b.id !== beam.id).concat([beamA, beamB]);
+  };
+
+  const applySupportBeamToBeam = () => {
+    if (!supportBeamMode) return;
+    if (supportSourceBeamId == null || supportTargetBeamId == null) return;
+    if (supportSourceBeamId === supportTargetBeamId) return;
+
+    let curP = [...pillars];
+    let curB = [...beams];
+    const source = curB.find((b) => b.id === supportSourceBeamId);
+    const support = curB.find((b) => b.id === supportTargetBeamId);
+    if (!source || !support) return;
+
+    const map = buildPillarMap(curP);
+    const sourceEnds = getBeamEndpoints(source, map);
+    const supportEnds = getBeamEndpoints(support, map);
+    const rawAngle = supportAngleInput.trim();
+    const angleVal = rawAngle === "" ? null : Number(rawAngle);
+    const angle = angleVal != null && isFinite(angleVal) ? angleVal : null;
+
+    const distStart = distancePointToSegment(
+      sourceEnds.start,
+      supportEnds.start,
+      supportEnds.end
+    );
+    const distEnd = distancePointToSegment(
+      sourceEnds.end,
+      supportEnds.start,
+      supportEnds.end
+    );
+    const order: Array<"start" | "end"> =
+      distStart <= distEnd ? ["start", "end"] : ["end", "start"];
+    let chosen: { endKey: "start" | "end"; point: Point3 } | null = null;
+    for (const endKey of order) {
+      const origin = endKey === "start" ? sourceEnds.start : sourceEnds.end;
+      const hit = getSupportIntersection(
+        origin,
+        supportEnds.start,
+        supportEnds.end,
+        angle
+      );
+      if (!hit) continue;
+      chosen = { endKey, point: hit };
+      break;
+    }
+    if (!chosen) return;
+
+    const anchorRes = ensureSupportAnchorAt(chosen.point, support, curP);
+    curP = anchorRes.pillars;
+    const anchor = anchorRes.pillar;
+
+    const mapAfterAnchor = buildPillarMap(curP);
+    curB = splitBeamAtAnchor(support, anchor, curB, mapAfterAnchor);
+
+    const startP = mapAfterAnchor.get(source.startId);
+    const endP = mapAfterAnchor.get(source.endId);
+    if (!startP || !endP) return;
+
+    let nextSource: Beam;
+    if (chosen.endKey === "start") {
+      nextSource = {
+        ...source,
+        startId: anchor.id,
+        originStartId: anchor.id,
+      };
+    } else {
+      nextSource = {
+        ...source,
+        endId: anchor.id,
+        originEndId: anchor.id,
+      };
+    }
+
+    const newStart = chosen.endKey === "start" ? anchor : startP;
+    const newEnd = chosen.endKey === "start" ? endP : anchor;
+    const dx = newEnd.x - newStart.x;
+    const dy = newEnd.y - newStart.y;
+    const span = Math.hypot(dx, dy);
+    nextSource = {
+      ...nextSource,
+      x1: newStart.x,
+      y1: newStart.y,
+      x2: newEnd.x,
+      y2: newEnd.y,
+      height: span / 10,
+      originStartId: nextSource.startId,
+      originEndId: nextSource.endId,
+    };
+
+    curB = curB.map((b) => (b.id === source.id ? nextSource : b));
+
+    const enforced = enforceAutoPillars(curP, curB);
+    const refreshed = refreshBeamsFromAnchors(curB, enforced);
+    setPillars(enforced);
+    setBeams(refreshed);
+    setSupportSourceBeamId(null);
+    setSupportTargetBeamId(null);
   };
 
   const generateGridInsidePolygon = (
     poly: Point3[],
     basePillars: Pillar[] = pillars,
-    baseBeams: Beam[] = beams
+    baseBeams: Beam[] = beams,
+    gridMode: "regular" | "contour" = "regular"
   ) => {
     if (!poly || poly.length < 3) return;
-    const n = poly.length;
-
     let minX = poly[0].x;
     let maxX = poly[0].x;
     let minY = poly[0].y;
@@ -839,136 +1459,119 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       maxY = Math.max(maxY, p.y);
     });
 
-    const xs = buildGridPositions(minX, maxX, maxSpanX);
-    const ys = buildGridPositions(minY, maxY, maxSpanY);
+    const xsBase = buildGridPositions(minX, maxX, maxSpanX);
+    const ysBase = buildGridPositions(minY, maxY, maxSpanY);
 
-    // Caso o pol√≠gono seja um ret√¢ngulo alinhado aos eixos, force a malha regular
-    const isAxisAlignedRect =
-      n === 4 &&
-      poly.every((p, i) => {
-        const q = poly[(i + 1) % n];
-        return Math.abs(p.x - q.x) < 1e-6 || Math.abs(p.y - q.y) < 1e-6;
-      });
-
-    if (isAxisAlignedRect) {
-      let curP: Pillar[] = [];
-      let curB: Beam[] = [];
-      const ensureP = (x: number, y: number) => {
-        const found = curP.find((pp) => Math.hypot(pp.x - x, pp.y - y) < 1e-4);
-        if (found) return found;
-        const created = addPillarDirect(x, y, "pre");
-        curP.push(created);
-        return created;
-      };
-      const addEdge = (pa: Point3, pb: Point3) => {
-        const res = applyAddBeamBetween(pa, pb, curP, curB);
-        curP = res.pillars;
-        curB = res.beams;
-      };
-
-      ys.forEach((y) => xs.forEach((x) => ensureP(x, y)));
-      ys.forEach((y) => {
-        for (let i = 0; i < xs.length - 1; i++) {
-          addEdge({ x: xs[i], y, z: 0 }, { x: xs[i + 1], y, z: 0 });
+    const mergePositions = (base: number[], extra: number[]) => {
+      const tol = 1e-4;
+      const all = [...base, ...extra].sort((a, b) => a - b);
+      const merged: number[] = [];
+      all.forEach((v) => {
+        if (merged.length === 0 || Math.abs(v - merged[merged.length - 1]) > tol) {
+          merged.push(v);
         }
       });
-      xs.forEach((x) => {
-        for (let j = 0; j < ys.length - 1; j++) {
-          addEdge({ x, y: ys[j], z: 0 }, { x, y: ys[j + 1], z: 0 });
-        }
-      });
-
-      const enforced = enforceAutoPillars(curP, curB);
-      const refreshed = refreshBeamsFromAnchors(curB, enforced);
-      setPillars(enforced);
-      setBeams(refreshed);
-      return;
-    }
-
-    const pointInPoly = (x: number, y: number) => {
-      let inside = false;
-      for (let i = 0, j = n - 1; i < n; j = i++) {
-        const xi = poly[i].x;
-        const yi = poly[i].y;
-        const xj = poly[j].x;
-        const yj = poly[j].y;
-
-        const cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
-        const dot = (x - xi) * (x - xj) + (y - yi) * (y - yj);
-        if (Math.abs(cross) < 1e-8 && dot <= 1e-8) {
-          return true;
-        }
-
-        const intersect = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
-        if (intersect) inside = !inside;
-      }
-      return inside;
+      return merged;
     };
+
+    const { xs: xsMerged, ys: ysMerged } =
+      gridMode === "contour"
+        ? {
+            xs: mergePositions(xsBase, poly.map((p) => p.x)),
+            ys: mergePositions(ysBase, poly.map((p) => p.y)),
+          }
+        : { xs: xsBase, ys: ysBase };
 
     let curPillars = [...basePillars];
     let curBeams = [...baseBeams];
 
-    const addEdge = (pa: Point3, pb: Point3) => {
-      const res = applyAddBeamBetween(pa, pb, curPillars, curBeams);
-      curPillars = res.pillars;
-      curBeams = res.beams;
-    };
-
-    const verticalSegments = (x0: number) => {
-      const intersections: number[] = [];
-      for (let i = 0; i < n; i++) {
-        const p1 = poly[i];
-        const p2 = poly[(i + 1) % n];
-        if (p1.x === p2.x) continue;
-        const xMin = Math.min(p1.x, p2.x);
-        const xMax = Math.max(p1.x, p2.x);
-        if (x0 < xMin || x0 >= xMax) continue;
-        const t = (x0 - p1.x) / (p2.x - p1.x);
-        if (t < 0 || t > 1) continue;
-        const y = p1.y + t * (p2.y - p1.y);
-        intersections.push(y);
-      }
-      intersections.sort((a, b) => a - b);
-      for (let k = 0; k + 1 < intersections.length; k += 2) {
-        const y1 = intersections[k];
-        const y2 = intersections[k + 1];
-        addEdge({ x: x0, y: y1, z: 0 }, { x: x0, y: y2, z: 0 });
-      }
-    };
-
-    const horizontalSegments = (y0: number) => {
-      const intersections: number[] = [];
-      for (let i = 0; i < n; i++) {
-        const p1 = poly[i];
-        const p2 = poly[(i + 1) % n];
-        if (p1.y === p2.y) continue;
-        const yMin = Math.min(p1.y, p2.y);
-        const yMax = Math.max(p1.y, p2.y);
-        if (y0 < yMin || y0 >= yMax) continue;
-        const t = (y0 - p1.y) / (p2.y - p1.y);
-        if (t < 0 || t > 1) continue;
-        const x = p1.x + t * (p2.x - p1.x);
-        intersections.push(x);
-      }
-      intersections.sort((a, b) => a - b);
-      for (let k = 0; k + 1 < intersections.length; k += 2) {
-        const x1 = intersections[k];
-        const x2 = intersections[k + 1];
-        addEdge({ x: x1, y: y0, z: 0 }, { x: x2, y: y0, z: 0 });
-      }
-    };
-
-    xs.forEach(verticalSegments);
-    ys.forEach(horizontalSegments);
-
-    const tolAdd = 1e-4;
-    xs.forEach((x) => {
-      ys.forEach((y) => {
-        if (pointInPoly(x, y)) {
-          const exists = curPillars.some((q) => Math.hypot(q.x - x, q.y - y) < tolAdd);
-          if (!exists) curPillars.push(addPillarDirect(x, y, "pre"));
+    const gridTol = 0.02;
+    const key = (x: number, y: number) => `${x.toFixed(4)}|${y.toFixed(4)}`;
+    const gridPillars = new Map<string, Pillar>();
+    const ensurePreAt = (x: number, y: number) => {
+      const found = curPillars.find(
+        (pp) =>
+          isVisiblePillar(pp) &&
+          Math.hypot(pp.x - x, pp.y - y) <= gridTol &&
+          pointInPolygon(poly, pp.x, pp.y)
+      );
+      if (found) {
+        if (isAutoLike(found)) {
+          found.kind = "pre";
+          found.homeX = found.x;
+          found.homeY = found.y;
         }
+        return found;
+      }
+      const created = addPillarDirect(x, y, "pre");
+      curPillars.push(created);
+      return created;
+    };
+
+    xsMerged.forEach((x) => {
+      ysMerged.forEach((y) => {
+        if (!pointInPolygon(poly, x, y)) return;
+        const k = key(x, y);
+        if (gridPillars.has(k)) return;
+        const pillar = ensurePreAt(x, y);
+        gridPillars.set(k, pillar);
       });
+    });
+
+    const ensureBeam = (a: Pillar, b: Pillar) => {
+      const exists = curBeams.some(
+        (bb) =>
+          (bb.startId === a.id && bb.endId === b.id) ||
+          (bb.startId === b.id && bb.endId === a.id)
+      );
+      if (exists) return;
+      const span = Math.hypot(b.x - a.x, b.y - a.y);
+      if (span < 1e-6) return;
+      const width = 0.15;
+      const height = span / 10;
+      curBeams.push({
+        id: Date.now() + Math.random(),
+        startId: a.id,
+        endId: b.id,
+        originStartId: a.id,
+        originEndId: b.id,
+        x1: a.x,
+        y1: a.y,
+        x2: b.x,
+        y2: b.y,
+        width,
+        height,
+      });
+    };
+
+    ysMerged.forEach((y) => {
+      for (let i = 0; i < xsMerged.length - 1; i++) {
+        const x1 = xsMerged[i];
+        const x2 = xsMerged[i + 1];
+        const k1 = key(x1, y);
+        const k2 = key(x2, y);
+        const a = gridPillars.get(k1);
+        const b = gridPillars.get(k2);
+        if (!a || !b) continue;
+        const mid = { x: (x1 + x2) / 2, y, z: 0 };
+        if (!pointInPolygon(poly, mid.x, mid.y)) continue;
+        ensureBeam(a, b);
+      }
+    });
+
+    xsMerged.forEach((x) => {
+      for (let j = 0; j < ysMerged.length - 1; j++) {
+        const y1 = ysMerged[j];
+        const y2 = ysMerged[j + 1];
+        const k1 = key(x, y1);
+        const k2 = key(x, y2);
+        const a = gridPillars.get(k1);
+        const b = gridPillars.get(k2);
+        if (!a || !b) continue;
+        const mid = { x, y: (y1 + y2) / 2, z: 0 };
+        if (!pointInPolygon(poly, mid.x, mid.y)) continue;
+        ensureBeam(a, b);
+      }
     });
 
     const enforced = enforceAutoPillars(curPillars, curBeams);
@@ -981,7 +1584,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     let newX = x;
     let newY = y;
 
-    const last = [...pillars].reverse().find(isPillarActive);
+    const last = [...pillars].reverse().find(isVisiblePillar);
 
     if (last && alignMode === "horizontal") {
       newY = last.y;
@@ -1024,6 +1627,15 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       base.diameter = pillarDiameter;
     }
     return base;
+  };
+
+  const buildAnchorPillar = (
+    x: number,
+    y: number,
+    role: AnchorRole
+  ): Pillar => {
+    const base = buildPillar(x, y, "anchor");
+    return { ...base, hidden: true, anchorRole: role };
   };
 
   const addPillarDirect = (
@@ -1197,7 +1809,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return true;
   };
 
-  const ensureBeamOrigins = (beamList: Beam[]) =>
+  const ensureBeamOrigins = (beamList: Beam[]): Beam[] =>
     beamList.map((b) => ({
       ...b,
       originStartId: b.originStartId ?? b.startId,
@@ -1210,7 +1822,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     let minY = Infinity;
     let maxY = -Infinity;
     pillarList.forEach((p) => {
-      if (!isPillarActive(p)) return;
+      if (!isVisiblePillar(p)) return;
       minX = Math.min(minX, p.x);
       maxX = Math.max(maxX, p.x);
       minY = Math.min(minY, p.y);
@@ -1229,7 +1841,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const tol = 1e-3;
     const selected = new Set(targetIds);
     const base = pillarList.filter(
-      (p) => isPillarActive(p) && !isAutoLike(p) && !isMoveClone(p)
+      (p) => isVisiblePillar(p) && !isAutoLike(p) && !isMoveClone(p)
     );
     if (base.length === 0) return new Set<number>();
     let minX = Infinity;
@@ -1397,7 +2009,15 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
           return;
         }
         const neighbor = byId.get(neighborId);
-        if (!neighbor || !isPillarActive(neighbor)) return;
+        if (!neighbor || !isVisiblePillar(neighbor)) return;
+        const neighborHome = getPillarHome(neighbor);
+        const borderTol = 1e-3;
+        const onSameBorder =
+          (info.onLeft && Math.abs(neighborHome.x - session.bounds.minX) <= borderTol) ||
+          (info.onRight && Math.abs(neighborHome.x - session.bounds.maxX) <= borderTol) ||
+          (info.onBottom && Math.abs(neighborHome.y - session.bounds.minY) <= borderTol) ||
+          (info.onTop && Math.abs(neighborHome.y - session.bounds.maxY) <= borderTol);
+        if (onSameBorder) return;
         const dx = neighbor.x - original.x;
         const dy = neighbor.y - original.y;
         const absDx = Math.abs(dx);
@@ -1591,9 +2211,114 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const nextPillars = pillarList.map((p) => ({ ...p }));
     const posKey = (x: number, y: number) =>
       `${coordKey(x)}|${coordKey(y)}`;
+    const byId = new Map<number, Pillar>(nextPillars.map((p) => [p.id, p]));
+    const session = moveSessionRef.current;
+    const cloneIds = new Set<number>(session?.cloneOrigins.keys() ?? []);
+    const sourceOriginalIds = new Set<number>(session?.cloneMap.keys() ?? []);
     const activeByKey = new Map<string, Pillar>();
+    const approachSuspendedBy = new Map<number, number>();
+    const approachProtected = new Set<number>();
+    const approachLineTol = 1e-3;
+
+    const registerApproachSuspension = (cloneId: number, originalId: number) => {
+      const clone = byId.get(cloneId);
+      const original = byId.get(originalId);
+      if (!clone || !original) return;
+      const home = getPillarHome(original);
+      const prev = prevPositions?.get(cloneId);
+      const next = nextPositions?.get(cloneId) ?? { x: clone.x, y: clone.y };
+      const stepDx = prev ? next.x - prev.x : 0;
+      const stepDy = prev ? next.y - prev.y : 0;
+      let axis: "x" | "y" | null = null;
+      let dir = 0;
+      if (moveAllowX && !moveAllowY) {
+        axis = "x";
+        dir = Math.sign(stepDx);
+      } else if (moveAllowY && !moveAllowX) {
+        axis = "y";
+        dir = Math.sign(stepDy);
+      } else if (Math.abs(stepDx) >= Math.abs(stepDy)) {
+        axis = "x";
+        dir = Math.sign(stepDx);
+      } else {
+        axis = "y";
+        dir = Math.sign(stepDy);
+      }
+      if (!axis || dir === 0) {
+        const dx = clone.x - home.x;
+        const dy = clone.y - home.y;
+        if (moveAllowX && !moveAllowY) {
+          axis = "x";
+          dir = Math.sign(dx);
+        } else if (moveAllowY && !moveAllowX) {
+          axis = "y";
+          dir = Math.sign(dy);
+        } else if (Math.abs(dx) >= Math.abs(dy)) {
+          axis = "x";
+          dir = Math.sign(dx);
+        } else {
+          axis = "y";
+          dir = Math.sign(dy);
+        }
+      }
+      if (!axis || dir === 0) return;
+      const lineVal = axis === "x" ? home.y : home.x;
+      const coord = axis === "x" ? clone.x : clone.y;
+      const maxSpan = axis === "x" ? maxSpanX : maxSpanY;
+
+      const candidates = nextPillars.filter((p) => {
+        if (!isPrePillar(p)) return false;
+        if (!isPillarActive(p)) return false;
+        if (isAutoLike(p)) return false;
+        if (isMoveClone(p)) return false;
+        if (cloneIds.has(p.id) || sourceOriginalIds.has(p.id)) return false;
+        const pHome = getPillarHome(p);
+        if (axis === "x") return Math.abs(pHome.y - lineVal) <= approachLineTol;
+        return Math.abs(pHome.x - lineVal) <= approachLineTol;
+      });
+      if (candidates.length === 0) return;
+      candidates.sort((a, b) => (axis === "x" ? a.x - b.x : a.y - b.y));
+
+      let first: Pillar | null = null;
+      let second: Pillar | null = null;
+      if (dir > 0) {
+        const ahead = candidates.filter(
+          (p) => (axis === "x" ? p.x : p.y) > coord + approachLineTol
+        );
+        if (ahead.length === 0) return;
+        first = ahead[0];
+        second = ahead[1] ?? null;
+      } else {
+        const behind = candidates.filter(
+          (p) => (axis === "x" ? p.x : p.y) < coord - approachLineTol
+        );
+        if (behind.length === 0) return;
+        first = behind[behind.length - 1];
+        second = behind[behind.length - 2] ?? null;
+      }
+
+      if (!first) return;
+      if (!second) {
+        approachProtected.add(first.id);
+        return;
+      }
+      const secondCoord = axis === "x" ? second.x : second.y;
+      const span = Math.abs(secondCoord - coord);
+      if (span < maxSpan - approachLineTol) {
+        approachSuspendedBy.set(first.id, cloneId);
+      } else {
+        approachProtected.add(first.id);
+      }
+    };
+
+    if (session) {
+      session.cloneOrigins.forEach((originalId, cloneId) => {
+        registerApproachSuspension(cloneId, originalId);
+      });
+    }
+
     nextPillars.forEach((p) => {
-      if (!isPillarActive(p)) return;
+      if (!isVisiblePillar(p)) return;
       activeByKey.set(posKey(p.x, p.y), p);
     });
 
@@ -1702,7 +2427,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     if (moveSessionRef.current?.active) return moveSessionRef.current;
     const activeTargets = Array.from(targetIds).filter((id) => {
       const p = pillars.find((pp) => pp.id === id);
-      return p && isPillarActive(p) && !isMoveClone(p);
+      return p && isVisiblePillar(p) && !isMoveClone(p);
     });
     if (activeTargets.length === 0) return null;
 
@@ -1835,6 +2560,30 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       }
     });
 
+    const passesTargetWithTolerance = (
+      origin: { x: number; y: number },
+      next: { x: number; y: number },
+      target: { x: number; y: number }
+    ) => {
+      const tol = 0.05;
+      const dx = next.x - origin.x;
+      const dy = next.y - origin.y;
+      if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return false;
+      const useX =
+        (moveAllowX && !moveAllowY) ||
+        (!(moveAllowY && !moveAllowX) && Math.abs(dx) >= Math.abs(dy));
+      if (useX) {
+        if (Math.abs(target.y - origin.y) > tol) return false;
+        const minX = Math.min(origin.x, next.x) - tol;
+        const maxX = Math.max(origin.x, next.x) + tol;
+        return target.x >= minX && target.x <= maxX;
+      }
+      if (Math.abs(target.x - origin.x) > tol) return false;
+      const minY = Math.min(origin.y, next.y) - tol;
+      const maxY = Math.max(origin.y, next.y) + tol;
+      return target.y >= minY && target.y <= maxY;
+    };
+
     const findCoveringClone = (target: { x: number; y: number }) => {
       for (const cloneId of cloneIds) {
         const clone = byId.get(cloneId);
@@ -1843,18 +2592,175 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
           originPositions.get(cloneId) ??
           prevPositions.get(cloneId) ??
           { x: clone.x, y: clone.y };
-        if (crossesOnPath(origin, { x: clone.x, y: clone.y }, target)) {
+        if (crossesOnPath(origin, { x: clone.x, y: clone.y }, target) ||
+            passesTargetWithTolerance(origin, { x: clone.x, y: clone.y }, target)) {
           return cloneId;
         }
       }
       return null;
     };
+    const shouldKeepPreForSpan = (pillar: Pillar, cloneId: number) => {
+      if (!isPrePillar(pillar)) return false;
+      const clone = byId.get(cloneId);
+      if (!clone) return false;
+      const tol = 1e-3;
+      const home = getPillarHome(pillar);
+      const lockX = moveAllowX && !moveAllowY;
+      const lockY = moveAllowY && !moveAllowX;
+      let axis: "x" | "y" | null = null;
+      if (lockX) axis = "x";
+      else if (lockY) axis = "y";
+      else if (Math.abs(clone.y - home.y) <= tol) axis = "x";
+      else if (Math.abs(clone.x - home.x) <= tol) axis = "y";
+      if (!axis) return false;
+      const maxSpan = axis === "x" ? maxSpanX : maxSpanY;
+      const homeVal = axis === "x" ? home.x : home.y;
+      const cloneVal = axis === "x" ? clone.x : clone.y;
+      const dir = cloneVal > homeVal + tol ? 1 : cloneVal < homeVal - tol ? -1 : 0;
+      if (dir === 0) return false;
+
+      let neighbor: Pillar | null = null;
+      nextPillars.forEach((other) => {
+        if (other.id === pillar.id || other.id === cloneId) return;
+        if (!isVisiblePillar(other)) return;
+        if (isAutoLike(other)) return;
+        const otherHome = getPillarHome(other);
+        if (axis === "x") {
+          if (Math.abs(otherHome.y - home.y) > tol) return;
+          const val = other.x;
+          if (dir > 0 && val > homeVal + tol) {
+            if (!neighbor || val < neighbor.x) neighbor = other;
+          } else if (dir < 0 && val < homeVal - tol) {
+            if (!neighbor || val > neighbor.x) neighbor = other;
+          }
+          return;
+        }
+        if (Math.abs(otherHome.x - home.x) > tol) return;
+        const val = other.y;
+        if (dir > 0 && val > homeVal + tol) {
+          if (!neighbor || val < neighbor.y) neighbor = other;
+        } else if (dir < 0 && val < homeVal - tol) {
+          if (!neighbor || val > neighbor.y) neighbor = other;
+        }
+      });
+
+      if (!neighbor) return false;
+      const neighborVal =
+        axis === "x" ? (neighbor as Pillar).x : (neighbor as Pillar).y;
+      const span = Math.abs(neighborVal - cloneVal);
+      return span > maxSpan + tol;
+    };
+    void shouldKeepPreForSpan;
+
+
+    const approachSuspendedBy = new Map<number, number>();
+    const approachProtected = new Set<number>();
+    const approachLineTol = 1e-3;
+
+    const registerApproachSuspension = (cloneId: number, originalId: number) => {
+      const clone = byId.get(cloneId);
+      const original = byId.get(originalId);
+      if (!clone || !original) return;
+      const home = getPillarHome(original);
+      const dx = clone.x - home.x;
+      const dy = clone.y - home.y;
+      let axis: "x" | "y" | null = null;
+      let dir = 0;
+      if (moveAllowX && !moveAllowY) {
+        axis = "x";
+        dir = Math.sign(dx);
+      } else if (moveAllowY && !moveAllowX) {
+        axis = "y";
+        dir = Math.sign(dy);
+      } else if (Math.abs(dx) >= Math.abs(dy)) {
+        axis = "x";
+        dir = Math.sign(dx);
+      } else {
+        axis = "y";
+        dir = Math.sign(dy);
+      }
+      if (!axis || dir === 0) return;
+
+      const lineVal = axis === "x" ? home.y : home.x;
+      const coord = axis === "x" ? clone.x : clone.y;
+      const maxSpan = axis === "x" ? maxSpanX : maxSpanY;
+
+      const candidates = nextPillars.filter((p) => {
+        if (!isPrePillar(p)) return false;
+        if (!isPillarActive(p)) return false;
+        if (isAutoLike(p)) return false;
+        if (isMoveClone(p)) return false;
+        if (cloneIds.has(p.id) || sourceOriginalIds.has(p.id)) return false;
+        const pHome = getPillarHome(p);
+        if (axis === "x") return Math.abs(pHome.y - lineVal) <= approachLineTol;
+        return Math.abs(pHome.x - lineVal) <= approachLineTol;
+      });
+      if (candidates.length === 0) return;
+      candidates.sort((a, b) => (axis === "x" ? a.x - b.x : a.y - b.y));
+
+      let first: Pillar | null = null;
+      let second: Pillar | null = null;
+      if (dir > 0) {
+        const ahead = candidates.filter(
+          (p) => (axis === "x" ? p.x : p.y) > coord + approachLineTol
+        );
+        if (ahead.length === 0) return;
+        first = ahead[0];
+        second = ahead[1] ?? null;
+      } else {
+        const behind = candidates.filter(
+          (p) => (axis === "x" ? p.x : p.y) < coord - approachLineTol
+        );
+        if (behind.length === 0) return;
+        first = behind[behind.length - 1];
+        second = behind[behind.length - 2] ?? null;
+      }
+
+      if (!first) return;
+      if (!second) {
+        approachProtected.add(first.id);
+        return;
+      }
+      const secondCoord = axis === "x" ? second.x : second.y;
+      const span = Math.abs(secondCoord - coord);
+      if (span < maxSpan - approachLineTol) {
+        approachSuspendedBy.set(first.id, cloneId);
+      } else {
+        approachProtected.add(first.id);
+      }
+    };
+
+    if (session) {
+      session.cloneOrigins.forEach((originalId, cloneId) => {
+        registerApproachSuspension(cloneId, originalId);
+      });
+    }
 
     nextPillars.forEach((p) => {
       if (cloneIds.has(p.id) || sourceOriginalIds.has(p.id)) return;
       if (fullBorderOriginals.has(p.id)) return;
       if (isAutoLike(p)) return;
       const target = getPillarHome(p);
+      const approachCloneId = approachSuspendedBy.get(p.id);
+      if (approachCloneId != null) {
+        if (p.state !== "suspended" || p.suspendedBy !== approachCloneId) {
+          p.state = "suspended";
+          p.suspendedBy = approachCloneId;
+          nextBeams = remapBeamsForSuspension(
+            nextBeams,
+            p.id,
+            approachCloneId
+          );
+        }
+        return;
+      }
+      if (approachProtected.has(p.id)) {
+        if (p.state !== "active") {
+          p.state = "active";
+          p.suspendedBy = undefined;
+        }
+        return;
+      }
       const coveringCloneId = findCoveringClone(target);
       if (coveringCloneId != null) {
         if (p.state !== "suspended" || p.suspendedBy !== coveringCloneId) {
@@ -2000,7 +2906,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const next = nextPositions.get(movedId);
       if (!prev || !next) return;
       pillarList.forEach((p) => {
-        if (!isPillarActive(p)) return;
+        if (!isVisiblePillar(p)) return;
         if (p.id === movedId) return;
         if (movedIds.has(p.id)) return;
         if (remap.has(p.id)) return;
@@ -2070,7 +2976,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const groups = new Map<string, Pillar[]>();
     const posKey = (x: number, y: number) => `${coordKey(x)}|${coordKey(y)}`;
     pillarList.forEach((p) => {
-      if (!isPillarActive(p)) return;
+      if (!isVisiblePillar(p)) return;
       const k = posKey(p.x, p.y);
       if (!groups.has(k)) groups.set(k, []);
       groups.get(k)!.push(p);
@@ -2168,9 +3074,18 @@ const clearAllPillars = () => {
   setDrawBeamMode(false);
   setDrawRectBeamMode(false);
   setDrawPolylineMode(false);
+  setBeamCantileverMode(false);
+  setSupportBeamMode(false);
+  setSupportSourceBeamId(null);
+  setSupportTargetBeamId(null);
+  setSupportAngleInput("");
   setBeamTempStart(null);
   setRectTempStart(null);
   setPolyPoints([]);
+  setPolyPreviewPoint(null);
+  setPolyHoverPillarId(null);
+  setSnapGuideX(null);
+  setSnapGuideY(null);
   setInsertMode(false);
   setDeleteMode(false);
   setMeasureMode(false);
@@ -2209,6 +3124,43 @@ const handlePillarClick = (id: number) => {
     deletePillar(id);
     return;
   }
+  if (drawPolylineMode) {
+    const pillar = pillars.find((p) => p.id === id && isVisiblePillar(p));
+    if (!pillar) return;
+    const anchor = { x: pillar.x, y: pillar.y, z: 0 };
+    const points = [...polyPoints];
+    if (points.length === 0) {
+      setPolyPoints([anchor]);
+      setPolyPreviewPoint(anchor);
+      setPolyHoverPillarId(pillar.id);
+      return;
+    }
+    const first = points[0];
+    if (
+      points.length >= 2 &&
+      Math.hypot(anchor.x - first.x, anchor.y - first.y) < 1e-6
+    ) {
+      finalizePolyline(points, pillars, beams);
+      return;
+    }
+    const last = points[points.length - 1];
+    const aligned =
+      Math.abs(anchor.x - last.x) < 1e-6 ||
+      Math.abs(anchor.y - last.y) < 1e-6;
+    if (!aligned) return;
+    if (Math.hypot(anchor.x - last.x, anchor.y - last.y) < 1e-6) return;
+    let curP = [...pillars];
+    let curB = [...beams];
+    const res = applyAddBeamBetween(last, anchor, curP, curB, "pre");
+    curP = res.pillars;
+    curB = res.beams;
+    setPillars(curP);
+    setBeams(curB);
+    setPolyPoints([...points, anchor]);
+    setPolyPreviewPoint(anchor);
+    setPolyHoverPillarId(pillar.id);
+    return;
+  }
   if (moveMode) {
     setSelectedPillarIds((prev) =>
       prev.includes(id) ? prev.filter((pid) => pid !== id) : [...prev, id]
@@ -2218,17 +3170,23 @@ const handlePillarClick = (id: number) => {
     setSelectedBeamSegment(null);
     return;
   }
+  if (drawBeamMode) {
+    const pillar = pillars.find((p) => p.id === id && isVisiblePillar(p));
+    if (!pillar) return;
+    handleBeamPointClick({ x: pillar.x, y: pillar.y, z: 0 });
+    return;
+  }
   setSelectedPillarId(id);
   setSelectedPillarIds([id]);
   setSelectedBeamId(null);
   setSelectedBeamSegment(null);
 };
-
 const handlePillarPointerDown = (pillar: Pillar, e: any) => {
   if (isClearingRef.current) return;
+  if (supportBeamMode) return;
   if (!moveMode || e?.nativeEvent?.buttons !== 1) return;
   const activeIds = new Set(
-    pillars.filter((p) => isPillarActive(p) && !isMoveClone(p)).map((p) => p.id)
+    pillars.filter((p) => isVisiblePillar(p) && !isMoveClone(p)).map((p) => p.id)
   );
   const ids = new Set<number>(
     selectedPillarIds.filter((id) => activeIds.has(id))
@@ -2249,55 +3207,71 @@ const handlePillarPointerDown = (pillar: Pillar, e: any) => {
     }
   });
   dragPrevPositionsRef.current = new Map(origins);
-  const p = e.point;
+  const point = e.point;
   setDragInitialPositions(origins);
-  setDragStartPoint({ x: p.x, y: p.y, z: p.z });
+  setDragStartPoint({ x: point.x, y: point.y, z: point.z });
   setIsDraggingPillars(true);
   setMoveSelection({ start: null, current: null });
 };
 
-const handleBeamClick = (item: Beam | BeamSegment) => {
-  const beamId = "beamId" in item ? item.beamId : item.id;
-  setSelectedBeamId(beamId);
-  setSelectedBeamSegment("beamId" in item ? item : null);
-  setSelectedPillarId(null);
-  setSelectedPillarIds([]);
-  const beam = beams.find((b) => b.id === beamId);
-  if (beam) {
-    setEditBeamWidth(beam.width);
-    setEditBeamHeight(beam.height);
-  }
-};
+  const handleBeamClick = (item: Beam | BeamSegment) => {
+    const beamId = "beamId" in item ? item.beamId : item.id;
+    if (supportBeamMode) {
+      setSelectedBeamId(beamId);
+      setSelectedBeamSegment(null);
+      setSelectedPillarId(null);
+      setSelectedPillarIds([]);
+      if (supportSourceBeamId == null || beamId === supportSourceBeamId) {
+        setSupportSourceBeamId(beamId);
+        if (beamId === supportSourceBeamId) setSupportTargetBeamId(null);
+      } else if (supportTargetBeamId == null || beamId === supportTargetBeamId) {
+        setSupportTargetBeamId(beamId);
+      } else {
+        setSupportSourceBeamId(beamId);
+        setSupportTargetBeamId(null);
+      }
+      return;
+    }
+    setSelectedBeamId(beamId);
+    setSelectedBeamSegment("beamId" in item ? item : null);
+    setSelectedPillarId(null);
+    setSelectedPillarIds([]);
+    const beam = beams.find((b) => b.id === beamId);
+    if (beam) {
+      setEditBeamWidth(beam.width);
+      setEditBeamHeight(beam.height);
+    }
+  };
 
 const movePillarsBy = (dx: number, dy: number) => {
   if (isClearingRef.current) return;
   const adjDx = moveAllowX ? dx : 0;
-    const adjDy = moveAllowY ? dy : 0;
-    const activeIds = new Set(
-      pillars.filter(isPillarActive).map((p) => p.id)
-    );
-    const targets = new Set<number>(
-      selectedPillarIds.filter((id) => activeIds.has(id))
-    );
-    if (selectedPillarId != null && activeIds.has(selectedPillarId))
-      targets.add(selectedPillarId);
-    const session =
-      moveSessionRef.current?.active && moveSessionRef.current
-        ? moveSessionRef.current
-        : startMoveSession(targets);
-    if (!session) return;
-    const origins = new Map<number, { x: number; y: number }>();
-    session.cloneOrigins.forEach((_origId, cloneId) => {
-      const clone = pillars.find((p) => p.id === cloneId);
-      if (clone) {
-        origins.set(cloneId, { x: clone.x, y: clone.y });
-      } else {
-        const prev = session.prevClonePositions.get(cloneId);
-        if (prev) origins.set(cloneId, prev);
-      }
-    });
-    applyMoveDeltaWithSession(adjDx, adjDy, origins, true);
-  };
+  const adjDy = moveAllowY ? dy : 0;
+  const activeIds = new Set(
+    pillars.filter(isVisiblePillar).map((p) => p.id)
+  );
+  const targets = new Set<number>(
+    selectedPillarIds.filter((id) => activeIds.has(id))
+  );
+  if (selectedPillarId != null && activeIds.has(selectedPillarId))
+    targets.add(selectedPillarId);
+  const session =
+    moveSessionRef.current?.active && moveSessionRef.current
+      ? moveSessionRef.current
+      : startMoveSession(targets);
+  if (!session) return;
+  const origins = new Map<number, { x: number; y: number }>();
+  session.cloneOrigins.forEach((_origId, cloneId) => {
+    const clone = pillars.find((p) => p.id === cloneId);
+    if (clone) {
+      origins.set(cloneId, { x: clone.x, y: clone.y });
+    } else {
+      const prev = session.prevClonePositions.get(cloneId);
+      if (prev) origins.set(cloneId, prev);
+    }
+  });
+  applyMoveDeltaWithSession(adjDx, adjDy, origins, true);
+};
 
 const applyDragDelta = (
   dx: number,
@@ -2310,8 +3284,10 @@ const applyDragDelta = (
   applyMoveDeltaWithSession(adjDx, adjDy, origins, false);
 };
 
-  const handlePlaneClick = (p: Point3, e?: any) => {
+const handlePlaneClick = (p: Point3, e?: any) => {
   if (isClearingRef.current) return;
+  if (supportBeamMode) return;
+  if (beamHoverPillarId != null) setBeamHoverPillarId(null);
   if (
     moveMode &&
     (selectedPillarIds.length > 0 || selectedPillarId != null) &&
@@ -2323,7 +3299,7 @@ const applyDragDelta = (
     if (!session) {
       const activeIds = new Set(
         pillars
-          .filter((pp) => isPillarActive(pp) && !isMoveClone(pp))
+          .filter((pp) => isVisiblePillar(pp) && !isMoveClone(pp))
           .map((pp) => pp.id)
       );
       const ids = new Set<number>(
@@ -2376,7 +3352,7 @@ const applyDragDelta = (
       const yMin = Math.min(moveSelection.start.y, p.y);
       const yMax = Math.max(moveSelection.start.y, p.y);
       const ids = pillars
-        .filter(isPillarActive)
+        .filter(isVisiblePillar)
         .filter(
           (pp) =>
             pp.x >= xMin && pp.x <= xMax && pp.y >= yMin && pp.y <= yMax
@@ -2388,126 +3364,144 @@ const applyDragDelta = (
     }
     return;
   }
-    
-    // 0) MODO RET√ÇNGULO DE VIGAS (2 cliques = cantos opostos)
-    if (drawRectBeamMode) {
-      setSelectedBeamId(null);
-      setSelectedPillarId(null);
-      setSelectedBeamSegment(null);
-      setSelectedPillarId(null);
 
-      if (!rectTempStart) {
-        // primeiro canto
-        const snapped = snapToPillarPoint(p);
-        setRectTempStart(snapped);
-      } else {
-        // segundo canto -> cria os 4 lados de vigas
-        const snapped = snapToPillarPoint(p);
-        const xMin = Math.min(rectTempStart.x, snapped.x);
-        const xMax = Math.max(rectTempStart.x, snapped.x);
-        const yMin = Math.min(rectTempStart.y, snapped.y);
-        const yMax = Math.max(rectTempStart.y, snapped.y);
+  if (drawRectBeamMode) {
+    setSelectedBeamId(null);
+    setSelectedPillarId(null);
+    setSelectedBeamSegment(null);
+    setSelectedPillarId(null);
 
-        const pA: Point3 = { x: xMin, y: yMin, z: 0 };
-        const pB: Point3 = { x: xMax, y: yMin, z: 0 };
-        const pC: Point3 = { x: xMax, y: yMax, z: 0 };
-        const pD: Point3 = { x: xMin, y: yMax, z: 0 };
+    if (!rectTempStart) {
+      const snapped = snapToPillarPoint(p);
+      setRectTempStart(snapped);
+    } else {
+      const snapped = snapToPillarPoint(p);
+      const xMin = Math.min(rectTempStart.x, snapped.x);
+      const xMax = Math.max(rectTempStart.x, snapped.x);
+      const yMin = Math.min(rectTempStart.y, snapped.y);
+      const yMax = Math.max(rectTempStart.y, snapped.y);
 
-        let curP = [...pillars];
-        let curB = [...beams];
-        const addEdge = (pa: Point3, pb: Point3) => {
-          const res = applyAddBeamBetween(pa, pb, curP, curB);
-          curP = res.pillars;
-          curB = res.beams;
-        };
+      const pA: Point3 = { x: xMin, y: yMin, z: 0 };
+      const pB: Point3 = { x: xMax, y: yMin, z: 0 };
+      const pC: Point3 = { x: xMax, y: yMax, z: 0 };
+      const pD: Point3 = { x: xMin, y: yMax, z: 0 };
 
-        addEdge(pA, pB);
-        addEdge(pB, pC);
-        addEdge(pC, pD);
-        addEdge(pD, pA);
+      generateGridInsidePolygon([pA, pB, pC, pD], pillars, beams, "regular");
 
-        const enforced = enforceAutoPillars(curP, curB);
-        const refreshed = refreshBeamsFromAnchors(curB, enforced);
-        setPillars(enforced);
-        setBeams(refreshed);
+      setRectTempStart(null);
+      setDrawRectBeamMode(false);
+    }
+    return;
+  }
 
-        generateGridInsidePolygon([pA, pB, pC, pD], enforced, refreshed);
+  if (drawPolylineMode) {
+    setSelectedBeamId(null);
+    setSelectedBeamSegment(null);
+    let curP = [...pillars];
+    let curB = [...beams];
+    const points = [...polyPoints];
+    const lastPoint = points[points.length - 1] ?? null;
+    const guide = computeSnapGuides(p);
+    setSnapGuideX(guide.x);
+    setSnapGuideY(guide.y);
+    const rawPoint = { x: p.x, y: p.y, z: 0 };
+    const snappedPoint = lastPoint
+      ? snapPolylinePoint(rawPoint, lastPoint, guide.x, guide.y)
+      : snapToGuides(rawPoint, guide.x, guide.y);
+    const hovered = lastPoint
+      ? getNearestAlignedPillar(snappedPoint, lastPoint)
+      : getNearestPillar(snappedPoint);
+    const anchorPoint = hovered
+      ? { x: hovered.x, y: hovered.y, z: 0 }
+      : snappedPoint;
+    const ensureVertex = (pt: Point3) => {
+      if (hovered) return anchorPoint;
+      const res = ensurePrePillarAtPoint(pt, curP);
+      curP = res.pillars;
+      return { x: res.pillar.x, y: res.pillar.y, z: 0 };
+    };
 
-        setRectTempStart(null);
-        setDrawRectBeamMode(false); // desativa modo ap√≥s fechar ret√¢ngulo
-      }
+    if (points.length === 0) {
+      const first = ensureVertex(anchorPoint);
+      setPillars(curP);
+      setPolyPoints([first]);
+      setPolyPreviewPoint(first);
+      setPolyHoverPillarId(hovered ? hovered.id : null);
       return;
     }
 
-    // 0.5) MODO POLILINHA DE VIGAS (cada clique conecta com o anterior)
-    if (drawPolylineMode) {
-      setSelectedBeamId(null);
-      setSelectedBeamSegment(null);
+    const last = points[points.length - 1];
+    const next = ensureVertex(anchorPoint);
+    if (Math.hypot(next.x - last.x, next.y - last.y) < 1e-6) return;
 
-      setPolyPoints((prev) => {
-        const snapped = snapToPillarPoint(p);
-        if (prev.length === 0) {
-          return [snapped];
-        } else {
-          const last = prev[prev.length - 1];
-          addBeamBetween(last, snapped);
-          return [...prev, snapped];
-        }
-      });
-      return;
+    const res = applyAddBeamBetween(last, next, curP, curB, "pre");
+    curP = res.pillars;
+    curB = res.beams;
+    setPillars(curP);
+    setBeams(curB);
+    setPolyPoints([...points, next]);
+    setPolyPreviewPoint(next);
+    setPolyHoverPillarId(hovered ? hovered.id : null);
+    return;
+  }
+
+  if (drawBeamMode) {
+    handleBeamPointClick(p);
+    return;
+  }
+
+  if (insertMode) {
+    addPillarAt(p.x, p.y);
+    return;
+  }
+
+  if (!measureMode) return;
+
+  setMeasurePoints((prev) => {
+    const updated = [...prev, p];
+    if (updated.length === 2) {
+      const [p1, p2] = updated;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const dz = p2.z - p1.z;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      setLastMeasurement({ p1, p2, dist: d });
+      return [];
     }
-
-    // 1) MODO DESENHAR VIGA (2 cliques)
-
-    if (drawBeamMode) {
-      setSelectedBeamId(null); // desmarca qualquer viga selecionada
-      setSelectedPillarId(null);
-      setSelectedBeamSegment(null);
-
-      if (!beamTempStart) {
-        // primeiro clique: guarda in?cio
-        const snapped = snapToPillarPoint(p);
-        setBeamTempStart(snapped);
-      } else {
-        // segundo clique: cria viga e limpa in?cio
-        let end = snapToPillarPoint(p);
-        if (drawAxisLock === "x") {
-          end = { ...end, x: beamTempStart.x };
-        } else if (drawAxisLock === "y") {
-          end = { ...end, y: beamTempStart.y };
-        }
-        addBeamBetween(beamTempStart, end);
-        setBeamTempStart(null);
-      }
-      return;
-    }
-
-    // 2) MODO INSERIR PILAR
-    if (insertMode) {
-      addPillarAt(p.x, p.y);
-      return;
-    }
-
-    // 3) MODO MEDIR
-    if (!measureMode) return;
-
-    setMeasurePoints((prev) => {
-      const updated = [...prev, p];
-      if (updated.length === 2) {
-        const [p1, p2] = updated;
-        const dx = p2.x - p1.x;
-        const dy = p2.y - p1.y;
-        const dz = p2.z - p1.z;
-        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        setLastMeasurement({ p1, p2, dist: d });
-        return [];
-      }
-      return updated;
-    });
-  };
-
+    return updated;
+  });
+};
   const handlePlaneMove = (p: Point3, e?: any) => {
     if (isClearingRef.current) return;
+    if (drawPolylineMode) {
+      const guide = computeSnapGuides(p);
+      setSnapGuideX(guide.x);
+      setSnapGuideY(guide.y);
+      const last = polyPoints[polyPoints.length - 1] ?? null;
+      const basePoint = last
+        ? snapPolylinePoint(p, last, guide.x, guide.y)
+        : snapToGuides(p, guide.x, guide.y);
+      const hovered = last
+        ? getNearestAlignedPillar(basePoint, last)
+        : getNearestPillar(basePoint);
+      if (hovered) {
+        setPolyPreviewPoint({ x: hovered.x, y: hovered.y, z: 0 });
+        setPolyHoverPillarId(hovered.id);
+      } else {
+        setPolyPreviewPoint({ x: basePoint.x, y: basePoint.y, z: 0 });
+        setPolyHoverPillarId(null);
+      }
+    } else if (polyHoverPillarId != null) {
+      setPolyHoverPillarId(null);
+    }
+
+    if (drawBeamMode) {
+      const hovered = getNearestPillar(p);
+      setBeamHoverPillarId(hovered ? hovered.id : null);
+    } else if (beamHoverPillarId != null) {
+      setBeamHoverPillarId(null);
+    }
+
     if (moveMode && moveSelection.start && !isDraggingPillars) {
       setMoveSelection({ start: moveSelection.start, current: p });
     }
@@ -2517,7 +3511,6 @@ const applyDragDelta = (
     const dy = p.y - dragStartPoint.y;
     applyDragDelta(dx, dy, dragInitialPositions);
   };
-
   const handlePlaneUp = () => {
     if (!isDraggingPillars) return;
     finalizeMoveSession();
@@ -2537,9 +3530,65 @@ const applyDragDelta = (
     ? beams.find((b) => b.id === selectedBeamId) || null
     : null;
   const selectedPillar = selectedPillarId
-    ? pillars.find((p) => p.id === selectedPillarId && isPillarActive(p)) ||
+    ? pillars.find((p) => p.id === selectedPillarId && isVisiblePillar(p)) ||
       null
     : null;
+  const polyPreviewSegment =
+    drawPolylineMode && polyPoints.length > 0 && polyPreviewPoint
+      ? {
+          start: polyPoints[polyPoints.length - 1],
+          end: polyPreviewPoint,
+        }
+      : null;
+  const polyPreviewPillars = polyPreviewSegment
+    ? getPreviewSegmentPoints(polyPreviewSegment.start, polyPreviewSegment.end)
+    : [];
+  const showPolyPreviewEnd =
+    polyPreviewSegment &&
+    !polyHoverPillarId &&
+    Math.hypot(
+      polyPreviewSegment.end.x - polyPreviewSegment.start.x,
+      polyPreviewSegment.end.y - polyPreviewSegment.start.y
+    ) > 1e-6;
+
+  const showSnapGuides = drawPolylineMode;
+  const snapGuideBounds = (() => {
+    if (pdf) {
+      const widthPaperMm = pdf.pageWidthPt * POINT_TO_MM;
+      const heightPaperMm = pdf.pageHeightPt * POINT_TO_MM;
+      const widthRealMm = widthPaperMm * scaleDenominator;
+      const heightRealMm = heightPaperMm * scaleDenominator;
+      const widthRealM = widthRealMm / 1000;
+      const heightRealM = heightRealMm / 1000;
+      return {
+        minX: -widthRealM / 2,
+        maxX: widthRealM / 2,
+        minY: -heightRealM / 2,
+        maxY: heightRealM / 2,
+      };
+    }
+    const active = pillars.filter(isVisiblePillar);
+    if (active.length > 0) {
+      let minX = active[0].x;
+      let maxX = active[0].x;
+      let minY = active[0].y;
+      let maxY = active[0].y;
+      active.forEach((p) => {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+      });
+      const margin = Math.max(1, Math.max(maxSpanX, maxSpanY));
+      return {
+        minX: minX - margin,
+        maxX: maxX + margin,
+        minY: minY - margin,
+        maxY: maxY + margin,
+      };
+    }
+    return { minX: -25, maxX: 25, minY: -25, maxY: 25 };
+  })();
 
   const getBeamAlignedPillars = (beam: Beam) => {
     const { x1, y1, x2, y2 } = beam;
@@ -2550,15 +3599,15 @@ const applyDragDelta = (
 
     const ux = dx / len;
     const uy = dy / len;
-    const tolPerp = 0.05; // toler√¢ncia transversal (m)
+    const tolPerp = 0.05; // toler‚ncia transversal (m)
     const margin = 0.05; // margem longitudinal (m)
 
     const candidates = pillars
-      .filter(isPillarActive)
+      .filter(isVisiblePillar)
       .map((p) => {
         const vx = p.x - x1;
         const vy = p.y - y1;
-        const t = vx * ux + vy * uy; // proje√ß√£o ao longo da viga
+        const t = vx * ux + vy * uy; // projeÁ„o ao longo da viga
         const perp = Math.abs(vx * -uy + vy * ux); // dist. perpendicular
         return { p, t, perp };
       })
@@ -2609,7 +3658,7 @@ const applyDragDelta = (
       if (t2 - t1 < 1e-4) continue;
 
       const segLen = t2 - t1;
-      const segHeight = segLen / 10; // regra h = v√£o/10 aplicada ao trecho
+      const segHeight = segLen / 10; // regra h = v„o/10 aplicada ao trecho
 
       const seg: BeamSegment = {
         id: `${beam.id}-${i}`,
@@ -2705,6 +3754,13 @@ const applyDragDelta = (
         })()
       : null;
 
+  void recalcPillarsForMove;
+  void restoreSuspendedPrePillars;
+  void updateMovedPillarHomes;
+  void normalizeTempPillars;
+  void absorbPassedPillars;
+  void mergeOverlappingPillars;
+
   return (
     <div style={{ display: "flex", width: "100vw", height: "100vh" }}>
       {/* PAINEL LATERAL */}
@@ -2728,11 +3784,11 @@ const applyDragDelta = (
             fontSize: 18,
           }}
         >
-          ‚ò∞
+          ?
           <span style={{ marginLeft: 8 }}>Painel</span>
         </div>
 
-        {/* SE√á√ÉO PDF */}
+        {/* SE«√O PDF */}
         <div
           style={{
             marginBottom: 8,
@@ -2755,7 +3811,7 @@ const applyDragDelta = (
               fontWeight: 600,
             }}
           >
-            üìÑ Projeto (PDF)
+            ?? Projeto (PDF)
           </button>
 
           {activePanel === "pdf" && (
@@ -2776,7 +3832,7 @@ const applyDragDelta = (
 
               {loading && (
                 <div style={{ fontSize: 12, marginBottom: 8 }}>
-                  Carregando PDF‚Ä¶
+                  Carregando PDFÖ
                 </div>
               )}
 
@@ -2846,11 +3902,15 @@ const applyDragDelta = (
                 </div>
               </div>
 
-              {/* medi√ß√£o */}
+              {/* mediÁ„o */}
               <div style={{ marginBottom: 8 }}>
                 <button
                   onClick={() => {
                     setMeasureMode((v) => !v);
+                    setSupportBeamMode(false);
+                    setSupportSourceBeamId(null);
+                    setSupportTargetBeamId(null);
+                    setSupportAngleInput("");
                     setInsertMode(false);
                     setDeleteMode(false);
                     setMoveMode(false);
@@ -2869,8 +3929,8 @@ const applyDragDelta = (
                   }}
                 >
                   {measureMode
-                    ? "üîé Medindo (clique em 2 pontos)"
-                    : "üìè Medir dist√¢ncia"}
+                    ? "?? Medindo (clique em 2 pontos)"
+                    : "?? Medir dist‚ncia"}
                 </button>
 
                 <button
@@ -2886,7 +3946,7 @@ const applyDragDelta = (
                     fontSize: 12,
                   }}
                 >
-                  Limpar medi√ß√£o
+                  Limpar mediÁ„o
                 </button>
               </div>
 
@@ -2907,13 +3967,13 @@ const applyDragDelta = (
                   marginTop: 4,
                 }}
               >
-                üîÑ Resetar vista 3D
+                ?? Resetar vista 3D
               </button>
             </div>
           )}
         </div>
 
-       {/* SE√á√ÉO ELEMENTOS (PILARES + VIGAS) */}
+       {/* SE«√O ELEMENTOS (PILARES + VIGAS) */}
         <div
           style={{
             marginBottom: 8,
@@ -2938,7 +3998,7 @@ const applyDragDelta = (
               fontWeight: 600,
             }}
           >
-            üß± ELEMENTOS
+            ?? ELEMENTOS
           </button>
 
           {activePanel === "pillars" && (
@@ -2991,7 +4051,7 @@ const applyDragDelta = (
               {pillarType === "retangular" && (
                 <div style={{ marginBottom: 10, fontSize: 13 }}>
                   <div style={{ marginBottom: 4, opacity: 0.8 }}>
-                    Dimens√µes (m):
+                    Dimensıes (m):
                   </div>
                   <div style={{ marginBottom: 4 }}>
                     Largura:
@@ -3032,7 +4092,7 @@ const applyDragDelta = (
 
               {pillarType === "circular" && (
                 <div style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>Di√¢metro (m):</div>
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Di‚metro (m):</div>
                   <input
                     type="number"
                     value={pillarDiameter}
@@ -3054,7 +4114,7 @@ const applyDragDelta = (
 
               <div style={{ marginBottom: 10, fontSize: 13 }}>
                 <div style={{ marginBottom: 4, opacity: 0.8 }}>
-                  Alinhamento dos pr√≥ximos pilares:
+                  Alinhamento dos prÛximos pilares:
                 </div>
                 <label style={{ display: "block" }}>
                   <input
@@ -3074,7 +4134,7 @@ const applyDragDelta = (
                     checked={alignMode === "horizontal"}
                     onChange={() => setAlignMode("horizontal")}
                   />{" "}
-                  Horizontal (mesmo Y do √∫ltimo)
+                  Horizontal (mesmo Y do ˙ltimo)
                 </label>
                 <label style={{ display: "block" }}>
                   <input
@@ -3084,7 +4144,7 @@ const applyDragDelta = (
                     checked={alignMode === "vertical"}
                     onChange={() => setAlignMode("vertical")}
                   />{" "}
-                  Vertical (mesmo X do √∫ltimo)
+                  Vertical (mesmo X do ˙ltimo)
                 </label>
               </div>
 
@@ -3095,6 +4155,10 @@ const applyDragDelta = (
                     if (novo) setViewMode("top");
                     return novo;
                   });
+                  setSupportBeamMode(false);
+                  setSupportSourceBeamId(null);
+                  setSupportTargetBeamId(null);
+                  setSupportAngleInput("");
                   setMeasureMode(false);
                   setDeleteMode(false);
                   setMoveMode(false);
@@ -3115,12 +4179,16 @@ const applyDragDelta = (
               >
                 {insertMode
                   ? "Clique no PDF para inserir pilar"
-                  : "‚ûï Inserir Pilar (clicando no PDF)"}
+                  : "? Inserir Pilar (clicando no PDF)"}
               </button>
 
               <button
                 onClick={() => {
                   setDeleteMode((v) => !v);
+                  setSupportBeamMode(false);
+                  setSupportSourceBeamId(null);
+                  setSupportTargetBeamId(null);
+                  setSupportAngleInput("");
                   setInsertMode(false);
                   setMeasureMode(false);
                   setMoveMode(false);
@@ -3139,8 +4207,8 @@ const applyDragDelta = (
                 }}
               >
                 {deleteMode
-                  ? "üóëÔ∏è Clique em um pilar para apagar"
-                  : "üóëÔ∏è Apagar Pilar"}
+                  ? "??? Clique em um pilar para apagar"
+                  : "??? Apagar Pilar"}
               </button>
 
               {/* ---------- VIGAS ---------- */}
@@ -3156,11 +4224,11 @@ const applyDragDelta = (
 
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>
-                    V√£o m√°ximo entre pilares:
+                    V„o m·ximo entre pilares:
                   </div>
                   <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 11 }}>Dire√ß√£o X (m):</div>
+                      <div style={{ fontSize: 11 }}>DireÁ„o X (m):</div>
                       <input
                         type="number"
                         step="0.1"
@@ -3178,7 +4246,7 @@ const applyDragDelta = (
                       />
                     </div>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 11 }}>Dire√ß√£o Y (m):</div>
+                      <div style={{ fontSize: 11 }}>DireÁ„o Y (m):</div>
                       <input
                         type="number"
                         step="0.1"
@@ -3242,6 +4310,10 @@ const applyDragDelta = (
                     setDrawBeamMode(novo);
                     setDrawRectBeamMode(false);
                     setDrawPolylineMode(false);
+                    setSupportBeamMode(false);
+                    setSupportSourceBeamId(null);
+                    setSupportTargetBeamId(null);
+                    setSupportAngleInput("");
                     setBeamTempStart(null);
                     setRectTempStart(null);
                     setPolyPoints([]);
@@ -3265,8 +4337,19 @@ const applyDragDelta = (
                 >
                   {drawBeamMode
                     ? "Clique em 2 pontos no PDF para criar viga"
-                    : "‚ûï Desenhar Viga (2 cliques no PDF)"}
+                    : "? Desenhar Viga (2 cliques no PDF)"}
                 </button>
+                {drawBeamMode && (
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 8 }}>
+                    <input
+                      type="checkbox"
+                      checked={beamCantileverMode}
+                      onChange={(e) => setBeamCantileverMode(e.target.checked)}
+                    />
+                    Viga em balan?o (n?o criar pilar no pr?ximo ponto)
+                  </label>
+                )}
+
 
                 <button
                   onClick={() => {
@@ -3274,6 +4357,10 @@ const applyDragDelta = (
                     setDrawRectBeamMode(novo);
                     setDrawBeamMode(false);
                     setDrawPolylineMode(false);
+                    setSupportBeamMode(false);
+                    setSupportSourceBeamId(null);
+                    setSupportTargetBeamId(null);
+                    setSupportAngleInput("");
                     setBeamTempStart(null);
                     setRectTempStart(null);
                     setPolyPoints([]);
@@ -3296,8 +4383,8 @@ const applyDragDelta = (
                   }}
                 >
                   {drawRectBeamMode
-                    ? "Clique em 2 cantos para criar ret√¢ngulo de vigas"
-                    : "‚¨õ Ret√¢ngulo de vigas (per√≠metro)"}
+                    ? "Clique em 2 cantos para criar ret‚ngulo de vigas"
+                    : "? Ret‚ngulo de vigas (perÌmetro)"}
                 </button>
 
                 <button
@@ -3306,6 +4393,10 @@ const applyDragDelta = (
                     setDrawPolylineMode(novo);
                     setDrawBeamMode(false);
                     setDrawRectBeamMode(false);
+                    setSupportBeamMode(false);
+                    setSupportSourceBeamId(null);
+                    setSupportTargetBeamId(null);
+                    setSupportAngleInput("");
                     setBeamTempStart(null);
                     setRectTempStart(null);
                     setPolyPoints([]);
@@ -3328,9 +4419,95 @@ const applyDragDelta = (
                   }}
                 >
                   {drawPolylineMode
-                    ? "Clique nos v√©rtices da polilinha de vigas"
-                    : "„Ä∞Ô∏è Polilinha de vigas"}
+                    ? "Clique nos vÈrtices da polilinha de vigas"
+                    : "?? Polilinha de vigas"}
                 </button>
+                <button
+                  onClick={() => {
+                    const novo = !supportBeamMode;
+                    setSupportBeamMode(novo);
+                    setSupportSourceBeamId(null);
+                    setSupportTargetBeamId(null);
+                    setSupportAngleInput("");
+                    if (novo) {
+                      setDrawBeamMode(false);
+                      setDrawRectBeamMode(false);
+                      setDrawPolylineMode(false);
+                      setBeamTempStart(null);
+                      setRectTempStart(null);
+                      setPolyPoints([]);
+                      setInsertMode(false);
+                      setMeasureMode(false);
+                      setDeleteMode(false);
+                      setMoveMode(false);
+                      setMoveSelection({ start: null, current: null });
+                    }
+                  }}
+                  style={{
+                    width: "100%",
+                    padding: 8,
+                    borderRadius: 4,
+                    border: "none",
+                    cursor: "pointer",
+                    background: supportBeamMode ? "#ffddaa" : "#225577",
+                    color: supportBeamMode ? "#333" : "#fff",
+                    fontSize: 13,
+                    marginBottom: 6,
+                  }}
+                >
+                  {supportBeamMode
+                    ? "Apoio viga em viga: selecione duas vigas"
+                    : "Apoiar viga em viga"}
+                </button>
+
+                {supportBeamMode && (
+                  <>
+                    <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 4 }}>
+                      Clique na viga a apoiar e depois na viga de apoio.
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 4 }}>
+                      Viga apoiada: {supportSourceBeamId ?? "-"} | Apoio: {supportTargetBeamId ?? "-"}
+                    </div>
+                    <input
+                      type="number"
+                      value={supportAngleInput}
+                      onChange={(e) => setSupportAngleInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          applySupportBeamToBeam();
+                        }
+                      }}
+                      placeholder="?ngulo (graus). Enter = ortogonal"
+                      style={{
+                        width: "100%",
+                        background: "#111",
+                        color: "#fff",
+                        border: "1px solid #333",
+                        borderRadius: 4,
+                        padding: "2px 4px",
+                        marginBottom: 6,
+                      }}
+                    />
+                    <button
+                      onClick={applySupportBeamToBeam}
+                      style={{
+                        width: "100%",
+                        padding: 6,
+                        borderRadius: 4,
+                        border: "1px solid #555",
+                        cursor: "pointer",
+                        background: "#222",
+                        color: "#ccc",
+                        fontSize: 12,
+                        marginBottom: 6,
+                      }}
+                    >
+                      Aplicar apoio
+                    </button>
+                  </>
+                )}
+
 
                 {beamTempStart && drawBeamMode && (
                   <div
@@ -3344,7 +4521,7 @@ const applyDragDelta = (
                   <div
                     style={{ fontSize: 11, opacity: 0.8, marginBottom: 6 }}
                   >
-                    Primeiro canto do ret√¢ngulo definido. Clique no canto oposto.
+                    Primeiro canto do ret‚ngulo definido. Clique no canto oposto.
                   </div>
                 )}
 
@@ -3361,7 +4538,7 @@ const applyDragDelta = (
                       continuar.
                     </div>
                     <button
-                      onClick={finalizePolyline}
+                      onClick={() => finalizePolyline()}
                       style={{
                         width: "100%",
                         padding: 6,
@@ -3447,7 +4624,7 @@ const applyDragDelta = (
                         fontSize: 12,
                       }}
                     >
-                      Aplicar altera√ß√µes na viga
+                      Aplicar alteraÁıes na viga
                     </button>
                   </div>
                 )}
@@ -3457,7 +4634,7 @@ const applyDragDelta = (
           )}
         </div>
 
-        {/* SE‚Ç¨√áO MODIFICAR */}
+        {/* SEÄ«O MODIFICAR */}
         <div
           style={{
             marginBottom: 8,
@@ -3482,7 +4659,7 @@ const applyDragDelta = (
               fontWeight: 600,
             }}
           >
-            ‚úèÔ∏è Modificar
+            ?? Modificar
           </button>
 
           {activePanel === "modify" && (
@@ -3509,6 +4686,10 @@ const applyDragDelta = (
                       setDrawBeamMode(false);
                       setDrawRectBeamMode(false);
                       setDrawPolylineMode(false);
+                      setSupportBeamMode(false);
+                      setSupportSourceBeamId(null);
+                      setSupportTargetBeamId(null);
+                      setSupportAngleInput("");
                       setInsertMode(false);
                       setMeasureMode(false);
                       setDeleteMode(false);
@@ -3748,18 +4929,20 @@ const applyDragDelta = (
           )}
 
       {pillars.map((p) => (
-      <PillarMesh
-        key={p.id}
-        pillar={p}
-        isSelected={
-          selectedPillarId === p.id || selectedPillarIds.includes(p.id)
-        }
-        onClick={() => handlePillarClick(p.id)}
-        onPointerDown={(pillar, e) => handlePillarPointerDown(pillar, e)}
-        onPointerMove={(point, e) => handlePlaneMove(point, e)}
-        onPointerUp={handlePlaneUp}
-      />
-    ))}
+        <PillarMesh
+          key={p.id}
+          pillar={p}
+          isSelected={
+            selectedPillarId === p.id || selectedPillarIds.includes(p.id)
+          }
+          isHoverAnchor={drawPolylineMode && polyHoverPillarId === p.id}
+          isHoverSnap={drawBeamMode && beamHoverPillarId === p.id}
+          onClick={() => handlePillarClick(p.id)}
+          onPointerDown={(pillar, e) => handlePillarPointerDown(pillar, e)}
+          onPointerMove={(point, e) => handlePlaneMove(point, e)}
+          onPointerUp={handlePlaneUp}
+        />
+      ))}
       
       {beams.flatMap((b) => splitBeamIntoSegments(b)).map((seg) => (
         <BeamMesh
@@ -3767,10 +4950,78 @@ const applyDragDelta = (
           beam={seg}
           topZ={pillarHeight}          // topo da viga = topo do pilar
           isSelected={selectedBeamSegment?.id === seg.id}
+          isSupportSource={supportSourceBeamId === seg.beamId}
+          isSupportTarget={supportTargetBeamId === seg.beamId}
           onClick={() => handleBeamClick(seg)}
         />
       ))}
 
+      {polyPreviewSegment && (
+        <group>
+          <Line
+            raycast={(_r: any, _i: any) => null}
+            points={[
+              [polyPreviewSegment.start.x, polyPreviewSegment.start.y, 0.05],
+              [polyPreviewSegment.end.x, polyPreviewSegment.end.y, 0.05],
+            ]}
+            color="#00ffee"
+            lineWidth={1}
+            dashed
+          />
+          {polyPreviewPillars.map((pt, idx) => (
+            <mesh
+              key={`poly-preview-${idx}`}
+              position={[pt.x, pt.y, 0.05]}
+              raycast={(_r: any, _i: any) => null}
+            >
+              <boxGeometry args={[0.2, 0.2, 0.05]} />
+              <meshBasicMaterial color="#00ffee" />
+            </mesh>
+          ))}
+          {showPolyPreviewEnd && (
+            <mesh
+              position={[
+                polyPreviewSegment.end.x,
+                polyPreviewSegment.end.y,
+                0.05,
+              ]}
+              raycast={(_r: any, _i: any) => null}
+            >
+              <sphereGeometry args={[0.08, 12, 12]} />
+              <meshBasicMaterial color="#00ffee" />
+            </mesh>
+          )}
+        </group>
+      )}
+
+      {showSnapGuides && (snapGuideX != null || snapGuideY != null) && (
+        <group>
+          {snapGuideX != null && (
+            <Line
+              raycast={(_r: any, _i: any) => null}
+              points={[
+                [snapGuideX, snapGuideBounds.minY, 0.07],
+                [snapGuideX, snapGuideBounds.maxY, 0.07],
+              ]}
+              color="#00aa55"
+              lineWidth={1}
+              dashed
+            />
+          )}
+          {snapGuideY != null && (
+            <Line
+              raycast={(_r: any, _i: any) => null}
+              points={[
+                [snapGuideBounds.minX, snapGuideY, 0.07],
+                [snapGuideBounds.maxX, snapGuideY, 0.07],
+              ]}
+              color="#00aa55"
+              lineWidth={1}
+              dashed
+            />
+          )}
+        </group>
+      )}
       {selectionRect && (
         <group>
           <Line
@@ -3805,7 +5056,7 @@ const applyDragDelta = (
             />
           )}
 
-          {/* CUBO DE VISTAS ‚Äì vers√£o que funcionou */}
+          {/* CUBO DE VISTAS ñ vers„o que funcionou */}
           <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
             <group scale={[40, 40, 40]}>
               <ambientLight intensity={1.2} />
@@ -3934,4 +5185,22 @@ const applyDragDelta = (
 
 
 export default App;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
