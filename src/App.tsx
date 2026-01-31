@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+ï»¿import { useState, useRef, useEffect } from "react";
 import { Canvas, useThree, useLoader } from "@react-three/fiber";
 import {
   OrbitControls,
@@ -11,7 +11,7 @@ import {
 } from "@react-three/drei";
 import * as pdfjsLib from "pdfjs-dist";
 import workerSrc from "./pdfWorker";
-import { TextureLoader, MOUSE } from "three";
+import { TextureLoader, MOUSE, Shape } from "three";
 
 (pdfjsLib as any).GlobalWorkerOptions.workerSrc = workerSrc as string;
 
@@ -27,6 +27,18 @@ type Point3 = { x: number; y: number; z: number };
 type PillarKind = "pre" | "auto" | "temp" | "anchor";
 type PillarState = "active" | "suspended";
 type AnchorRole = "free" | "support";
+
+type SteelProfile = {
+  name: string;
+  mass: number; // kg/m
+  d: number; // m
+  bf: number; // m
+  tw: number; // m
+  tf: number; // m
+  r: number; // m
+};
+
+type MaterialType = "concreto" | "metalico";
 
 type Pillar = {
   id: number;
@@ -46,6 +58,9 @@ type Pillar = {
   suspendedBy?: number;
   hidden?: boolean;
   anchorRole?: AnchorRole;
+  isSteel?: boolean;
+  steelProfile?: string;
+  steelAuto?: boolean;
 };
 type Beam = {
   id: number;
@@ -59,6 +74,9 @@ type Beam = {
   y2: number;
   width: number;  // largura (m)
   height: number; // altura (m)
+  isSteel?: boolean;
+  steelProfile?: string;
+  steelAuto?: boolean;
 };
 
 type BeamSegment = {
@@ -70,6 +88,9 @@ type BeamSegment = {
   y2: number;
   width: number;
   height: number;
+  isSteel?: boolean;
+  steelProfile?: string;
+  steelAuto?: boolean;
 };
 
 type MoveSelection = {
@@ -91,6 +112,245 @@ type OrthoView = "top" | "bottom" | "front" | "back" | "left" | "right";
 type ViewMode = "3d" | OrthoView;
 
 const POINT_TO_MM = 25.4 / 72;
+
+const STEEL_PROFILE_DATA = `"BITOLA
+mm x kg/m";"Massa Linear
+kg/m";"d 
+mm";"bf
+ mm";"tw 
+mm";"tf
+mm";"h 
+mm";"d' 
+mm";R[mm];Ãrea cm2;"lx 
+cm4";"Wx 
+cm3";"rx 
+cm";"Zx 
+cm3";"ly 
+cm4";"Wy
+cm3";"ry 
+cm";"Zy 
+cm3";"rt 
+cm";"lt 
+cm4";"Mesa - Î»f
+bf/2.tf";"Alma - Î»w
+d'/tw";"cw
+cm6";"u
+m2/m";"BITOLA
+in x Ib/ft";"Massividade (m-1)
+4 Faces Exp.
+Pilares";"Massividade (m-1)
+1 Face Protegida
+Vigas"
+W 150 x 13,0;13,0;148;100;4,3;4,9;138;118;10;16,6;635;85,8;6,2;96,4;82;16,4;2,2;25,5;2,6;1,7;10,2;27,5;4.181;0,67;W 6 x 8,5;403,61;343,37
+W 150 x 18,0;18,0;153;102;5,8;7,1;139;119;10;23,4;939;122,8;6,3;139,4;126;24,7;2,3;38,5;2,7;4,3;7,2;20,5;6.683;0,69;W 6 x 12;294,87;251,28
+W 150 x 22,5 (H);22,5;152;152;5,8;6,6;139;119;10;29,0;1229;161,7;6,5;179,6;387;50,9;3,7;77,9;4,1;4,8;11,5;20,5;20.417;0,88;W 6 x 15;303,45;251,03
+W 150 x 24,0;24,0;160;102;6,6;10,3;139;115;12;31,5;1384;173,0;6,6;197,6;183;35,9;2,4;55,8;2,7;11,1;5,0;17,5;10.206;0,69;W 6 x 16;219,05;186,67
+W 150 x 29,8 (H);29,8;157;153;6,6;9,3;138;118;10;38,5;1739;221,5;6,7;247,5;556;72,6;3,8;110,8;4,2;11,0;8,2;17,9;30.277;0,90;W 6 x 20;233,77;194,03
+W 150 x 37,1 (H);37,1;162;154;8,1;11,6;139;119;10;47,8;2244;277,0;6,9;313,5;707;91,8;3,8;140,4;4,2;20,6;6,6;14,7;39.930;0,91;W 6 x 25;190,38;158,16
+W 200 x 15,0;15,0;200;100;4,3;5,2;190;170;10;19,4;1305;130,5;8,2;147,9;87;17,4;2,1;27,3;2,6;2,1;9,6;39,4;8.222;0,77;W 8 x 10;396,91;345,36
+W 200 x 19,3;19,3;203;102;5,8;6,5;190;170;10;25,1;1686;166,1;8,2;190,6;116;22,7;2,1;35,9;2,6;4,0;7,9;29,3;11.098;0,79;W 8 x 13;314,74;274,10
+W 200 x 22,5;22,5;206;102;6,2;8,0;190;170;10;29,0;2029;197,0;8,4;225,5;142;27,9;2,2;43,9;2,6;6,2;6,4;27,4;13.868;0,79;W 8 x 15;272,41;237,24
+W 200 x 26,6;26,6;207;133;5,8;8,4;190;170;10;34,2;2611;252,3;8,7;282,3;330;49,6;3,1;76,3;3,5;7,7;7,9;29,3;32.477;0,92;W 8 x 18;269,01;230,12
+W 200 x 31,3;31,3;210;134;6,4;10,2;190;170;10;40,3;3168;301,7;8,9;338,6;410;61,2;3,2;94,0;3,6;12,6;6,6;26,5;40.822;0,93;W 8 x 21;230,77;197,52
+W 200 x 35,9 (H);35,9;201;165;6,2;10,2;181;161;10;45,7;3437;342,0;8,7;379,2;764;92,6;4,1;141,0;4,5;14,5;8,1;25,9;69.502;1,03;W 8 x 24;225,38;189,28
+W 200 x 41,7 (H);41,7;205;166;7,2;11,8;181;157;12;53,5;4114;401,4;8,8;448,6;901;108,5;4,1;165,7;4,5;23,2;7,0;21,9;83.948;1,04;W 8 x 28;194,39;163,36
+W 200 x 46,1 (H);46,1;203;203;7,2;11,0;181;161;10;58,6;4543;447,6;8,8;495,3;1535;151,2;5,1;229,5;5,6;22,0;9,2;22,4;141.342;1,19;W 8 x 31;203,07;168,43
+W 200 x 52,0 (H);52,0;206;204;7,9;12,6;181;157;12;66,9;5298;514,4;8,9;572,5;1784;174,9;5,2;265,8;5,6;33,3;8,1;19,9;166.710;1,19;W 8 x 35;177,88;147,38
+HP 200 x 53,0 (H);53,0;204;207;11,3;11,3;181;161;10;68,1;4977;488,0;8,6;551,3;1673;161,7;5,0;248,6;5,6;31,9;9,2;14,3;155.075;1,20;HP 8 x 36;176,21;145,81
+W 200 x 59,0 (H);59,0;210;205;9,1;14,2;182;158;12;76,0;6140;584,8;9,0;655,9;2041;199,1;5,2;303,0;5,6;47,7;7,2;17,3;195.418;1,20;W 8 x 40;157,89;130,92
+W 200 x 71,0 (H);71,0;216;206;10,2;17,4;181;161;10;91,0;7660;709,2;9,2;803,2;2537;246,3;5,3;374,5;5,7;81,7;5,9;15,8;249.976;1,22;W 8 x 48;134,07;111,43
+W 200 x 86,0 (H);86,0;222;209;13,0;20,6;181;157;12;110,9;9498;855,7;9,3;984,2;3139;300,4;5,3;458,7;5,8;142,2;5,1;12,1;317.844;1,23;W 8 x 58;110,91;92,06
+W 200 x 100,0 (H)*;100,0;229;210;14,5;23,7;182;158;12;127,1;11355;991,7;9,5;1152,2;3664;349,0;5,4;533,4;5,8;212,6;4,4;10,9;385.454;1,25;W 8 x 67;98,35;81,83
+W 250 x 17,9;17,9;251;101;4,8;5,3;240;220;10;23,1;2291;182,6;10,0;211,0;91;18,1;2,0;28,8;2,5;2,5;9,5;45,9;13.735;0,88;W 10 x 12;380,95;337,23
+W 250 x 22,3;22,3;254;102;5,8;6,9;240;220;10;28,9;2939;231,4;10,1;267,7;123;24,1;2,1;38,4;2,5;4,8;7,4;38,0;18.629;0,89;W 10 x 15;307,96;272,66
+W 250 x 25,3;25,3;257;102;6,1;8,4;240;220;10;32,6;3473;270,2;10,3;311,1;149;29,3;2,1;46,4;2,6;7,1;6,1;36,1;22.955;0,89;W 10 x 17;273,01;241,72
+W 250 x 28,4;28,4;260;102;6,4;10,0;240;220;10;36,6;4046;311,2;10,5;357,3;178;34,8;2,2;54,9;2,6;10,3;5,1;34,4;27.636;0,90;W 10 x 19;245,90;218,03
+W 250 x 32,7;32,7;258;146;6,1;9,1;240;220;10;42,1;4937;382,7;10,8;428,5;473;64,8;3,4;99,7;3,9;10,4;8,0;36,0;73.104;1,07;W 10 x 22;254,16;219,48
+W 250 x 38,5;38,5;262;147;6,6;11,2;240;220;10;49,6;6057;462,4;11,1;517,8;594;80,8;3,5;124,1;3,9;17,6;6,6;33,3;93.242;1,08;W 10 x 26;217,74;188,10
+W 250 x 44,8;44,8;266;148;7,6;13,0;240;220;10;57,6;7158;538,2;11,2;606,3;704;95,1;3,5;146,4;4,0;27,1;5,7;29,0;112.398;1,09;W 10 x 30;189,24;163,54
+HP 250 x 62,0 (H);62,0;246;256;10,5;10,7;225;201;12;79,6;8728;709,6;10,5;790,5;2995;234,0;6,1;357,8;6,9;33,5;12,0;19,1;414.130;1,47;HP 10 x 42;184,67;152,51
+W 250 x 73,0 (H);73,0;253;254;8,6;14,2;225;201;12;92,7;11257;889,9;11,0;983,3;3880;305,5;6,5;463,1;7,0;56,9;8,9;23,3;552.900;1,48;W 10 x 49;159,65;132,25
+W 250 x 80,0 (H);80,0;256;255;9,4;15,6;225;201;12;101,9;12550;980,5;11,1;1088,7;4313;338,3;6,5;513,1;7,0;75,0;8,2;21,4;622.878;1,49;W 10 x 54;146,22;121,20
+HP 250 x 85,0 (H);85,0;254;260;14,4;14,4;225;201;12;108,5;12280;966,9;10,6;1093,2;4225;325,0;6,2;499,6;7,0;82,1;9,0;14,0;605.403;1,50;HP 10 x 57;138,25;114,29
+W 250 x 89,0 (H);89,0;260;256;10,7;17,3;225;201;12;113,9;14237;1095,1;11,2;1224,4;4841;378,2;6,5;574,3;7,1;102,8;7,4;18,8;712.351;1,50;W 10 x 60;131,69;109,22
+W 250 x 101,0 (H);101,0;264;257;11,9;19,6;225;201;12;128,7;16352;1238,8;11,3;1395,0;5549;431,8;6,6;656,3;7,1;147,7;6,6;16,9;828.031;1,51;W 10 x 68;117,33;97,36
+W 250 x 115,0 (H);115,0;269;259;13,5;22,1;225;201;12;146,1;18920;1406,7;11,4;1597,4;6405;494,6;6,6;752,7;7,2;212,0;5,9;14,9;975.265;1,53;W 10 x 77;104,72;87,00
+W 250 x 131,0 (H)*;131,0;275;261;15,4;25,1;225;193;16;167,8;22243;1617,7;11,5;1855,6;7448;570,7;6,7;870,7;7,2;321,1;5,2;12,5;1.161.225;1,54;W 10 x 88;91,78;76,22
+W 250 x 149,0 (H)*;149,0;282;263;17,3;28,4;225;193;16;190,5;26027;1845,9;11,7;2137,5;8624;655,8;6,7;1001,7;7,3;462,1;4,6;11,2;1.384.436;1,55;W 10 x 100;81,36;67,56
+W 250 x 167,0 (H)*;167,0;289;265;19,2;31,8;225;193;16;214,0;30110;2083,7;11,9;2435,3;9880;745,7;6,8;1140,2;7,3;645,0;4,2;10,1;1.631.156;1,57;W 10 x 112;73,36;60,98
+W 310 x 21,0;21,0;303;101;5,1;5,7;292;272;10;27,2;3776;249,2;11,8;291,9;98;19,5;1,9;31,4;2,4;3,3;8,9;53,3;21.628;0,98;W 12 x 14;360,29;323,16
+W 310 x 23,8;23,8;305;101;5,6;6,7;292;272;10;30,7;4346;285,0;11,9;333,2;116;22,9;1,9;36,9;2,5;4,7;7,5;48,5;25.594;0,99;W 12 x 16;322,48;289,58
+W 310 x 28,3;28,3;309;102;6,0;8,9;291;271;10;36,5;5500;356,0;12,3;412,0;158;31,0;2,1;49,4;2,6;8,1;5,7;45,2;35.441;1,00;W 12 x 19;273,97;246,03
+W 310 x 32,7;32,7;313;102;6,6;10,8;291;271;10;42,1;6570;419,8;12,5;485,3;192;37,6;2,1;59,8;2,6;12,9;4,7;41,1;43.612;1,00;W 12 x 22;237,53;213,30
+W 310 x 38,7;38,7;310;165;5,8;9,7;291;271;10;49,7;8581;553,6;13,1;615,4;727;88,1;3,8;134,9;4,4;13,2;8,5;46,7;163.728;1,25;W 12 x 26;251,51;218,31
+W 310 x 44,5;44,5;313;166;6,6;11,2;291;271;10;57,2;9997;638,8;13,2;712,8;855;103,0;3,9;158,0;4,4;19,9;7,4;41,0;194.433;1,26;W 12 x 30;220,28;191,26
+W 310 x 52,0;52,0;317;167;7,6;13,2;291;271;10;67,0;11909;751,4;13,3;842,5;1026;122,9;3,9;188,8;4,5;31,8;6,3;35,6;236.422;1,27;W 12 x 35;189,55;164,63
+W 310 x 60,0*;60,0;303;203;7,5;13,1;277;245;16;76,1;12908;852,0;13,0;944,3;1829;180,2;4,9;275,4;5,5;40,5;7,8;32,6;383.747;1,38;W 12 x 40;181,34;154,66
+W 310 x 67,0*;67,0;306;204;8,5;14,6;277;245;16;85,3;14559;951,5;13,1;1060,4;2069;202,8;4,9;310,5;5,5;55,4;7,0;28,8;438.542;1,38;W 12 x 45;161,78;137,87
+W 310 x 74,0*;74,0;310;205;9,4;16,3;277;245;16;95,1;16501;1064,6;13,2;1192,0;2344;228,7;5,0;350,5;5,5;75,5;6,3;26,1;504.715;1,39;W 12 x 50;146,16;124,61
+HP 310 x 79,0 (H);79,0;299;306;11,0;11,0;277;245;16;100,0;16316;1091,3;12,8;1210,1;5258;343,7;7,3;525,4;8,2;46,7;13,9;22,3;1.089.258;1,77;HP 12 x 53;177,00;146,40
+HP 310 x 93,0 (H);93,0;303;308;13,1;13,1;277;245;16;119,2;19682;1299,1;12,9;1450,3;6387;414,7;7,3;635,5;8,3;77,3;11,8;18,7;1.340.320;1,78;HP 12 x 63;149,33;123,49
+W 310 x 97,0 (H);97,0;308;305;9,9;15,4;277;245;16;123,6;22284;1447,0;13,4;1594,2;7286;477,8;7,7;725,0;8,4;92,1;9,9;24,8;1.558.682;1,79;W 12 x 65;144,82;120,15
+W 310 x 107,0 (H);107,0;311;306;10,9;17,0;277;245;16;136,4;24839;1597,3;13,5;1768,2;8123;530,9;7,7;806,1;8,4;122,7;9,0;22,5;1.754.271;1,80;W 12 x 72;131,96;109,53
+HP 310 x 110,0 (H);110,0;308;310;15,4;15,5;277;245;16;141,0;23703;1539,1;13,0;1730,6;7707;497,3;7,4;763,7;8,3;125,7;10,0;15,9;1.646.104;1,80;HP 12 x 74;127,66;105,67
+W 310 x 117,0 (H);117,0;314;307;11,9;18,7;277;245;16;149,9;27563;1755,6;13,6;1952,6;9024;587,9;7,8;893,1;8,4;161,6;8,2;20,6;1.965.950;1,80;W 12 x 79;120,08;99,60
+HP 310 x 125,0 (H);125,0;312;312;17,4;17,4;277;245;16;159,0;27076;1735,6;13,1;1963,3;8823;565,6;7,5;870,6;8,4;178,0;9,0;14,1;1.911.029;1,81;HP 12 x 84;113,84;94,21
+W 310 x 129,0 (H)*;129,0;318;308;13,1;20,6;277;245;16;165,4;30819;1938,3;13,7;2167,6;10039;651,9;7,8;991,2;8,5;214,7;7,5;18,7;2.218.146;1,81;W 12 x 87;109,43;90,81
+HP 310 x 132 (H)*;132,0;314;313;18,3;18,3;277;245;16;167,5;28731;1830,0;13,1;2075,5;9371;598,8;7,5;922,4;8,4;206,8;8,6;13,4;2.044.445;1,82;HP 12 x 89;108,66;89,97
+W 310 x 143,0 (H)*;143,0;323;309;14,0;22,9;277;245;16;182,5;34812;2155,6;13,8;2422,2;11270;729,4;7,9;1109,2;8,5;288,8;6,8;17,5;2.535.314;1,83;W 12 x 96;100,27;83,34
+W 310 x 158,0 (H)*;158,0;327;310;15,5;25,1;277;245;16;200,7;38681;2365,8;13,9;2675,7;12474;804,8;7,9;1225,2;8,6;380,0;6,2;15,8;2.839.709;1,84;W 12 x 106;91,68;76,23
+W 310 x 179,0 (H)*;179,0;333;313;18,0;28,1;277;245;16;227,9;44580;2677,5;14,0;3056,2;14378;918,7;7,9;1401,7;8,6;541,0;5,6;13,6;3.337.666;1,85;W 12 x 120;81,18;67,44
+W 310 x 202,0 (H)*;202,0;341;315;20,1;31,8;277;245;16;258,3;52030;3051,6;14,2;3513,7;16589;1053,2;8,0;1608,7;8,7;778,0;5,0;12,2;3.959.374;1,87;W 12 x 136;72,40;60,20
+W 360 x 32,9;32,9;349;127;5,8;8,5;332;308;12;42,1;8358;479,0;14,1;547,6;291;45,9;2,6;72,0;3,2;9,2;7,5;53,1;84.111;1,17;W 14 x 22;277,91;247,74
+W 360 x 39,0;39,0;353;128;6,5;10,7;332;308;12;50,2;10331;585,3;14,4;667,7;375;58,6;2,7;91,9;3,3;15,8;6,0;47,3;109.551;1,18;W 14 x 26;235,06;209,56
+W 360 x 44,6;44,6;352;171;6,9;9,8;332;308;12;57,7;12258;696,5;14,6;784,3;818;95,7;3,8;148,0;4,4;16,7;8,7;44,7;239.091;1,35;W 14 x 30;233,97;204,33
+W 360 x 51,0;51,0;355;171;7,2;11,6;332;308;12;64,8;14222;801,2;14,8;899,5;968;113,3;3,9;174,7;4,5;24,7;7,4;42,8;284.994;1,36;W 14 x 34;209,88;183,49
+W 360 x 58,0;58,0;358;172;7,9;13,1;332;308;12;72,5;16143;901,8;14,9;1014,8;1113;129,4;3,9;199,8;4,5;34,5;6,6;39,0;330.394;1,37;W 14 x 38;188,97;165,24
+W 360 x 64,0;64,0;347;203;7,7;13,5;320;288;16;81,7;17890;1031,1;14,8;1145,5;1885;185,7;4,8;284,5;5,4;44,6;7,5;37,4;523.362;1,46;W 14 x 43;178,70;153,86
+W 360 x 72,0;72,0;350;204;8,6;15,1;320;288;16;91,3;20169;1152,5;14,9;1285,9;2140;209,8;4,8;321,8;5,5;61,2;6,8;33,5;599.082;1,47;W 14 x 48;161,01;138,66
+W 360 x 79,0;79,0;354;205;9,4;16,8;320;288;16;101,2;22713;1283,2;15,0;1437,0;2416;235,7;4,9;361,9;5,5;82,4;6,1;30,7;685.701;1,48;W 14 x 53;146,25;125,99
+W 360 x 91,0 (H);91,0;353;254;9,5;16,4;320;288;16;115,9;26755;1515,9;15,2;1680,1;4483;353,0;6,2;538,1;6,9;92,6;7,7;30,3;1.268.709;1,68;W 14 x 61;144,95;123,04
+W 360 x 101,0 (H);101,0;357;255;10,5;18,3;320;286;17;129,5;30279;1696,3;15,3;1888,9;5063;397,1;6,3;606,1;6,9;128,5;7,0;27,3;1.450.410;1,68;W 14 x 68;129,73;110,04
+W 360 x 110,0 (H);110,0;360;256;11,4;19,9;320;288;16;140,6;33155;1841,9;15,4;2059,3;5570;435,2;6,3;664,5;7,0;161,9;6,4;25,3;1.609.070;1,69;W 14 x 74;120,20;101,99
+W 360 x 122,0 (H);122,0;363;257;13,0;21,7;320;288;16;155,3;36599;2016,5;15,4;2269,8;6147;478,4;6,3;732,4;7,0;212,7;5,9;22,1;1.787.806;1,70;W 14 x 82;109,47;92,92
+W 410 x 38,8;38,8;399;140;6,4;8,8;381;357;12;50,3;12777;640,5;15,9;736,8;404;57,7;2,8;90,9;3,5;11,7;8,0;55,8;153.190;1,32;W 16 x 26;262,43;234,59
+W 410 x 46,1;46,1;403;140;7,0;11,2;381;357;12;59,2;15690;778,7;16,3;891,1;514;73,4;3,0;115,2;3,6;20,1;6,3;50,9;196.571;1,33;W 16 x 31;224,66;201,01
+W 410 x 53,0;53,0;403;177;7,5;10,9;381;357;12;68,4;18734;929,7;16,6;1052,2;1009;114,0;3,8;176,9;4,6;23,4;8,1;47,6;387.194;1,48;W 16 x 36;216,37;190,50
+W 410 x 60,0;60,0;407;178;7,7;12,8;381;357;12;76,2;21707;1066,7;16,9;1201,5;1205;135,4;4,0;209,2;4,7;33,8;7,0;46,4;467.404;1,49;W 16 x 40;195,54;172,18
+W 410 x 67,0;67,0;410;179;8,8;14,4;381;357;12;86,3;24678;1203,8;16,9;1362,7;1379;154,1;4,0;239,0;4,7;48,1;6,2;40,6;538.546;1,50;W 16 x 45;173,81;153,07
+W 410 x 75,0;75,0;413;180;9,7;16,0;381;357;12;95,8;27616;1337,3;17,0;1518,6;1559;173,2;4,0;269,1;4,7;65,2;5,6;36,8;612.784;1,51;W 16 x 50;157,62;138,83
+W 410 x 85,0;85,0;417;181;10,9;18,2;381;357;12;108,6;31658;1518,4;17,1;1731,7;1804;199,3;4,1;310,4;4,7;94,5;5,0;32,7;715.165;1,52;W 16 x 57;139,96;123,30
+W 460 x 52,0;52,0;450;152;7,6;10,8;428;404;12;66,6;21370;949,8;17,9;1095,9;634;83,5;3,1;131,7;3,8;21,8;7,0;53,2;304.837;1,47;W 18 x 35;220,72;197,90
+W 460 x 60,0;60,0;455;153;8,0;13,3;428;404;12;76,2;25652;1127,6;18,4;1292,1;796;104,1;3,2;163,4;3,9;34,6;5,8;50,6;387.230;1,49;W 18 x 40;195,54;175,46
+W 460 x 68,0;68,0;459;154;9,1;15,4;428;404;12;87,6;29851;1300,7;18,5;1495,4;941;122,2;3,3;192,4;3,9;52,3;5,0;44,4;461.163;1,50;W 18 x 46;171,23;153,65
+W 460 x 74,0;74,0;457;190;9,0;14,5;428;404;12;94,9;33415;1462,4;18,8;1657,4;1661;174,8;4,2;271,3;4,9;53,0;6,6;44,9;811.417;1,64;W 18 x 50;172,81;152,79
+W 460 x 82,0;82,0;460;191;9,9;16,0;428;404;12;104,7;37157;1615,5;18,8;1836,4;1862;195,0;4,2;303,3;5,0;70,6;6,0;40,8;915.745;1,64;W 18 x 55;156,64;138,40
+W 460 x 89,0;89,0;463;192;10,5;17,7;428;404;12;114,1;41105;1775,6;19,0;2019,4;2093;218,0;4,3;339,0;5,0;92,5;5,4;38,4;1.035.073;1,65;W 18 x 60;144,61;127,78
+W 460 x 97,0;97,0;466;193;11,4;19,0;428;404;12;123,4;44658;1916,7;19,0;2187,4;2283;236,6;4,3;368,8;5,0;115,1;5,1;35,4;1.137.180;1,66;W 18 x 65;134,52;118,88
+W 460 x 106,0;106,0;469;194;12,6;20,6;428;404;12;135,1;48978;2088,6;19,0;2394,6;2515;259,3;4,3;405,7;5,1;148,2;4,7;32,1;1.260.063;1,67;W 18 x 71;123,61;109,25
+W 530 x 66,0;66,0;525;165;8,9;11,4;502;478;12;83,6;34971;1332,2;20,5;1558,0;857;103,9;3,2;166,0;4,0;31,5;7,2;53,7;562.854;1,67;W 21 x 44;199,76;180,02
+W 530 x 72,0;72,0;524;207;9,0;10,9;502;478;12;91,6;39969;1525,5;20,9;1755,9;1615;156,0;4,2;244,6;5,2;33,4;9,5;53,1;1.060.548;1,84;W 21 x 48;200,87;178,28
+W 530 x 74,0;74,0;529;166;9,7;13,6;502;478;12;95,1;40969;1548,9;20,8;1804,9;1041;125,5;3,3;200,1;4,1;47,4;6,1;49,3;688.558;1,68;W 21 x 50;176,66;159,20
+W 530 x 82,0;82,0;528;209;9,5;13,3;501;477;12;104,5;47569;1801,8;21,3;2058,5;2028;194,1;4,4;302,7;5,3;51,2;7,9;50,3;1.340.255;1,85;W 21 x 55;177,03;157,03
+W 530 x 85,0;85,0;535;166;10,3;16,5;502;478;12;107,7;48453;1811,3;21,2;2099,8;1263;152,2;3,4;241,6;4,2;72,9;5,0;46,4;845.463;1,69;W 21 x 57;156,92;141,50
+W 530 x 92,0;92,0;533;209;10,2;15,6;502;478;12;117,6;55157;2069,7;21,7;2359,8;2379;227,6;4,5;354,7;5,4;75,5;6,7;46,8;1.588.565;1,86;W 21 x 62;158,16;140,39
+W 530 x 101,0;101,0;537;210;10,9;17,4;502;470;16;130,0;62198;2316,5;21,9;2640,4;2693;256,5;4,6;400,6;5,4;106,0;6,0;43,1;1.812.734;1,86;W 21 x 68;143,08;126,92
+W 530 x 109,0;109,0;539;211;11,6;18,8;501;469;16;139,7;67226;2494,5;21,9;2847,0;2952;279,8;4,6;437,4;5,4;131,4;5,6;40,5;1.991.291;1,87;W 21 x 73;133,86;118,75
+W 530 x 123,0*;123,0;544;212;13,1;21,2;502;470;16;157,8;76577;2815,3;22,0;3228,1;3378;318,7;4,6;500,2;5,5;186,7;5,0;35,9;2.300.400;1,88;W 21 x 83;119,14;105,70
+W 530 x 138,0*;138,0;549;214;14,7;23,8;501;469;16;177,8;87079;3172,3;22,1;3653,3;3904;364,8;4,7;574,5;5,5;262,8;4,5;31,9;2.680.751;1,90;W 21 x 93;106,86;94,83
+W 610 x 82,0;82,0;599;178;10,0;12,8;573;541;16;105,1;56628;1890,8;23,2;2219,9;1210;135,9;3,4;219,0;4,3;51,8;7,0;54,1;1.033.595;1,86;W 24 x 55;176,97;160,04
+W 610 x 92,0;92,0;603;179;10,9;15,0;573;541;16;118,4;65277;2165,1;23,5;2535,8;1442;161,1;3,5;259,3;4,4;74,7;6,0;49,6;1.239.349;1,87;W 24 x 62;157,94;142,82
+W 610 x 101,0;101,0;603;228;10,5;14,9;573;541;16;130,3;77003;2554,0;24,3;2922,7;2951;258,8;4,8;405,0;5,8;81,7;7,7;51,5;2.544.966;2,07;W 24 x 68;158,86;141,37
+W 610 x 113,0;113,0;608;228;11,2;17,3;573;541;16;145,3;88196;2901,2;24,6;3312,9;3426;300,5;4,9;469,7;5,8;116,5;6,6;48,3;2.981.078;2,08;W 24 x 76;143,15;127,46
+W 610 x 125,0;125,0;612;229;11,9;19,6;573;541;16;160,1;99184;3241,3;24,9;3697,3;3933;343,5;5,0;536,3;5,9;159,5;5,8;45,5;3.441.766;2,09;W 24 x 84;130,54;116,24
+W 610 x 140,0;140,0;617;230;13,1;22,2;573;541;16;179,3;112619;3650,5;25,1;4173,1;4515;392,6;5,0;614,0;5,9;225,0;5,2;41,3;3.981.687;2,10;W 24 x 94;117,12;104,29
+W 610 x 153,0;154,2;623;229;14,0;24,9;573;541;16;196,5;125783;4038,0;25,3;4622,7;4999;436,6;5,0;683,3;5,9;303,3;4,6;38,7;4.456.995;2,11;W 24 x 103;107,38;95,73
+W 610 x 155,0;155,0;611;324;12,7;19,0;573;541;16;198,1;129583;4241,7;25,6;4749,1;10783;665,6;7,4;1022,6;8,5;200,8;8,5;42,6;9.436.714;2,47;W 24 x 104;124,68;108,33
+W 610 x 174,0;174,0;616;325;14,0;21,6;573;541;16;222,8;147754;4797,2;25,8;5383,3;12374;761,5;7,5;1171,1;8,6;286,9;7,5;38,6;10.915.665;2,48;W 24 x 117;111,31;96,72
+W 610 x 195,0*;195,0;622;327;15,4;24,4;573;541;16;250,1;168484;5417,5;26,0;6095,4;14240;870,9;7,6;1341 ,0;8,7;405,3;6,7;35,1;12.695.302;2,49;W 24 x 131;99,56;86,49
+W 610 x 217,0;217,0;628;328;16,5;27,7;573;541;16;278,4;191395;6095,4;26,2;6868,8;16316;994,9;7,7;1531,6;8,7;570,2;5,9;32,8;14.676.643;2,51;W 24 x 146`;
+
+const parseNumberBR = (value: string) => {
+  if (!value) return NaN;
+  const cleaned = value
+    .toString()
+    .replace(/\s+/g, "")
+    .replace(/\./g, "")
+    .replace(",", ".");
+  return parseFloat(cleaned);
+};
+
+const parseSteelProfiles = (data: string): SteelProfile[] => {
+  const lines = data
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length <= 1) return [];
+  const profiles: SteelProfile[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(";");
+    if (cols.length < 9) continue;
+    const name = cols[0].replace(/\"/g, "").trim();
+    if (!name || (!name.startsWith("W") && !name.startsWith("HP"))) continue;
+    const mass = parseNumberBR(cols[1]);
+    const d = parseNumberBR(cols[2]);
+    const bf = parseNumberBR(cols[3]);
+    const tw = parseNumberBR(cols[4]);
+    const tf = parseNumberBR(cols[5]);
+    const r = parseNumberBR(cols[8]);
+    if ([mass, d, bf, tw, tf, r].some((v) => !isFinite(v))) continue;
+    profiles.push({
+      name,
+      mass,
+      d: d / 1000,
+      bf: bf / 1000,
+      tw: tw / 1000,
+      tf: tf / 1000,
+      r: r / 1000,
+    });
+  }
+  return profiles;
+};
+
+const STEEL_PROFILES = parseSteelProfiles(STEEL_PROFILE_DATA);
+const getSteelProfileByName = (name?: string) =>
+  STEEL_PROFILES.find((p) => p.name === name) ?? null;
+
+const selectSteelProfile = (spanM: number): SteelProfile | null => {
+  if (!STEEL_PROFILES.length) return null;
+  const required = spanM / 12;
+  const candidates = STEEL_PROFILES.filter((p) => p.d >= required);
+  if (candidates.length > 0) {
+    return candidates.reduce((best, cur) =>
+      cur.mass < best.mass ? cur : best
+    );
+  }
+  const maxD = Math.max(...STEEL_PROFILES.map((p) => p.d));
+  const biggest = STEEL_PROFILES.filter((p) => p.d === maxD);
+  return biggest.reduce((best, cur) => (cur.mass < best.mass ? cur : best));
+};
+
+const getSteelProfileForBeam = (spanM: number, choice: string) => {
+  if (choice && choice !== "auto") {
+    return getSteelProfileByName(choice) ?? selectSteelProfile(spanM);
+  }
+  return selectSteelProfile(spanM);
+};
+
+const getSteelProfileForPillar = (choice: string) => {
+  if (choice && choice !== "auto") {
+    return getSteelProfileByName(choice);
+  }
+  if (!STEEL_PROFILES.length) return null;
+  return STEEL_PROFILES.reduce((best, cur) =>
+    cur.mass < best.mass ? cur : best
+  );
+};
+
+const buildIShape = (profile: SteelProfile) => {
+  const d = profile.d;
+  const bf = profile.bf;
+  const tf = profile.tf;
+  const tw = profile.tw;
+  const halfD = d / 2;
+  const halfBF = bf / 2;
+  const halfTW = tw / 2;
+  const shape = new Shape();
+  shape.moveTo(-halfBF, halfD);
+  shape.lineTo(halfBF, halfD);
+  shape.lineTo(halfBF, halfD - tf);
+  shape.lineTo(halfTW, halfD - tf);
+  shape.lineTo(halfTW, -halfD + tf);
+  shape.lineTo(halfBF, -halfD + tf);
+  shape.lineTo(halfBF, -halfD);
+  shape.lineTo(-halfBF, -halfD);
+  shape.lineTo(-halfBF, -halfD + tf);
+  shape.lineTo(-halfTW, -halfD + tf);
+  shape.lineTo(-halfTW, halfD - tf);
+  shape.lineTo(-halfBF, halfD - tf);
+  shape.closePath();
+  return shape;
+};
 
 const isPillarActive = (p: Pillar) => p.state !== "suspended";
 const isMoveClone = (p: Pillar) => !!p.moveClone;
@@ -193,7 +453,7 @@ function CameraController({
 }
 
 // -------------------------------------------------------------
-// VIEW CUBE – versão que funcionou
+// VIEW CUBE   vers o que funcionou
 // -------------------------------------------------------------
 function ViewCube({
   viewMode,
@@ -232,7 +492,7 @@ function ViewCube({
           <planeGeometry args={[0.8, 0.8]} />
           <meshBasicMaterial
             color={color}
-            depthTest={false} // não "briga" com a cena
+            depthTest={false} // n o "briga" com a cena
           />
         </mesh>
 
@@ -427,6 +687,8 @@ function BeamMesh({
   isSupportTarget?: boolean;
 }) {
   const { x1, y1, x2, y2, width, height } = beam;
+  const isSteel = !!beam.isSteel;
+  const steelProfile = isSteel ? getSteelProfileByName(beam.steelProfile) : null;
 
   const dx = x2 - x1;
   const dy = y2 - y1;
@@ -447,6 +709,40 @@ function BeamMesh({
       : isSelected
         ? "#ffcc00"
         : "#8888ff";
+
+  if (isSteel && steelProfile) {
+    const shape = buildIShape(steelProfile);
+    return (
+      <mesh
+        position={[midX, midY, centerZ]}
+        rotation={[0, 0, angle]}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClick && onClick();
+        }}
+      >
+        <extrudeGeometry
+          args={[
+            shape,
+            {
+              depth: span,
+              bevelEnabled: false,
+            },
+          ]}
+          onUpdate={(geom) => {
+            if (!geom.userData.centered) {
+              // Alinha: extrusÃ£o no eixo X, altura no eixo Z (alma em pÃ©)
+              geom.rotateY(Math.PI / 2);
+              geom.rotateX(Math.PI / 2);
+              geom.translate(-span / 2, 0, 0);
+              geom.userData.centered = true;
+            }
+          }}
+        />
+        <meshStandardMaterial color={color} />
+      </mesh>
+    );
+  }
 
   return (
     <mesh
@@ -488,6 +784,8 @@ function PillarMesh({
 }) {
   if (!isPillarActive(pillar) || pillar.hidden) return null;
   const { x, y, type, width, length, diameter, height } = pillar;
+  const isSteel = !!pillar.isSteel;
+  const steelProfile = isSteel ? getSteelProfileByName(pillar.steelProfile) : null;
 
   const h = height ?? 3;
   const baseZ = 0;
@@ -502,6 +800,49 @@ function PillarMesh({
         : type === "retangular"
           ? "#ffaa33"
           : "#55ccff";
+
+  if (isSteel && steelProfile) {
+    const shape = buildIShape(steelProfile);
+    return (
+      <mesh
+        position={[x, y, centerZ]}
+        onClick={(e) => {
+          e.stopPropagation();
+          onClick && onClick();
+        }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          onPointerDown && onPointerDown(pillar, e);
+        }}
+        onPointerMove={(e) => {
+          e.stopPropagation();
+          onPointerMove &&
+            onPointerMove({ x: e.point.x, y: e.point.y, z: e.point.z }, e);
+        }}
+        onPointerUp={(e) => {
+          e.stopPropagation();
+          onPointerUp && onPointerUp();
+        }}
+      >
+        <extrudeGeometry
+          args={[
+            shape,
+            {
+              depth: h,
+              bevelEnabled: false,
+            },
+          ]}
+          onUpdate={(geom) => {
+            if (!geom.userData.centered) {
+              geom.translate(0, 0, -h / 2);
+              geom.userData.centered = true;
+            }
+          }}
+        />
+        <meshStandardMaterial color={color} />
+      </mesh>
+    );
+  }
 
   if (type === "retangular") {
     const w = width ?? 0.3;
@@ -591,7 +932,7 @@ function App() {
   const [pillarWidth, setPillarWidth] = useState(0.3);
   const [pillarLength, setPillarLength] = useState(0.4);
   const [pillarDiameter, setPillarDiameter] = useState(0.4);
-  // vãos máximos para geração automática de pilares
+  // v os m ximos para gera  o autom tica de pilares
   const [maxSpanX, setMaxSpanX] = useState(6); // m
   const [maxSpanY, setMaxSpanY] = useState(6); // m
 
@@ -604,15 +945,17 @@ function App() {
   } | null>(null);
   const [beamHoverPillarId, setBeamHoverPillarId] = useState<number | null>(null);
   const [beamCantileverMode, setBeamCantileverMode] = useState(false);
+  const [beamMaterial, setBeamMaterial] = useState<MaterialType>("concreto");
+  const [beamSteelProfile, setBeamSteelProfile] = useState<string>("auto");
   const [supportBeamMode, setSupportBeamMode] = useState(false);
   const [supportSourceBeamId, setSupportSourceBeamId] = useState<number | null>(null);
   const [supportTargetBeamId, setSupportTargetBeamId] = useState<number | null>(null);
   const [supportAngleInput, setSupportAngleInput] = useState("");
-  // modo retângulo de vigas (perímetro retangular)
+  // modo ret ngulo de vigas (per metro retangular)
   const [drawRectBeamMode, setDrawRectBeamMode] = useState(false);
   const [rectTempStart, setRectTempStart] = useState<Point3 | null>(null);
 
-  // modo polilinha de vigas (perímetro qualquer)
+  // modo polilinha de vigas (per metro qualquer)
   const [drawPolylineMode, setDrawPolylineMode] = useState(false);
   const [polyPoints, setPolyPoints] = useState<Point3[]>([]);
   const [polyPreviewPoint, setPolyPreviewPoint] = useState<Point3 | null>(null);
@@ -636,14 +979,9 @@ function App() {
       const x = guideX != null ? guideX : target.x;
       return { ...target, x, y: origin.y };
     }
-    const dx = Math.abs(target.x - origin.x);
-    const dy = Math.abs(target.y - origin.y);
-    if (dx >= dy) {
-      const x = guideX != null ? guideX : target.x;
-      return { ...target, x, y: origin.y };
-    }
+    const x = guideX != null ? guideX : target.x;
     const y = guideY != null ? guideY : target.y;
-    return { ...target, x: origin.x, y };
+    return { ...target, x, y };
   };
   const finalizePolyline = (
     points: Point3[] = polyPoints,
@@ -668,26 +1006,6 @@ function App() {
     const dist = Math.hypot(first.x - last.x, first.y - last.y);
 
     if (dist > 1e-6) {
-      const aligned =
-        Math.abs(first.x - last.x) < 1e-6 || Math.abs(first.y - last.y) < 1e-6;
-      if (!aligned) {
-        const prev =
-          closedPoints.length >= 2
-            ? closedPoints[closedPoints.length - 2]
-            : null;
-        const prevHorizontal =
-          prev && Math.abs(prev.y - last.y) <= Math.abs(prev.x - last.x);
-        const mid: Point3 = prevHorizontal
-          ? { x: last.x, y: first.y, z: 0 }
-          : { x: first.x, y: last.y, z: 0 };
-        if (Math.hypot(mid.x - last.x, mid.y - last.y) > 1e-6) {
-          const res = applyAddBeamBetween(last, mid, curP, curB, "pre");
-          curP = res.pillars;
-          curB = res.beams;
-          closedPoints.push(mid);
-          last = mid;
-        }
-      }
       const res = applyAddBeamBetween(last, first, curP, curB, "pre");
       curP = res.pillars;
       curB = res.beams;
@@ -753,6 +1071,9 @@ const [editBeamHeight, setEditBeamHeight] = useState(0.3); // m (valor inicial q
   const [insertMode, setInsertMode] = useState(false);
   const [deleteMode, setDeleteMode] = useState(false);
   const [pillars, setPillars] = useState<Pillar[]>([]);
+  const [pillarMaterial, setPillarMaterial] = useState<MaterialType>("concreto");
+  const [pillarSteelProfile, setPillarSteelProfile] =
+    useState<string>("auto");
 
   const [alignMode, setAlignMode] = useState<
     "livre" | "horizontal" | "vertical"
@@ -762,9 +1083,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
   "pdf"
 );
 
+  const pillarIsSteel = pillarMaterial === "metalico";
+  const beamIsSteel = beamMaterial === "metalico";
+
   const isOrtho = viewMode !== "3d";
 
-  // SHIFT -> força 3D/perspectiva
+  // SHIFT -> for a 3D/perspectiva
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Shift") {
@@ -829,7 +1153,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return positions;
   };
 
-  function pointInPolygon(poly: Point3[], x: number, y: number) {
+  function pointInPolygon(
+    poly: Point3[],
+    x: number,
+    y: number,
+    includeEdge = true
+  ) {
     if (!poly || poly.length < 3) return false;
     let inside = false;
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -841,7 +1170,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const cross = (xj - xi) * (y - yi) - (yj - yi) * (x - xi);
       const dot = (x - xi) * (x - xj) + (y - yi) * (y - yj);
       if (Math.abs(cross) < 1e-8 && dot <= 1e-8) {
-        return true;
+        return includeEdge;
       }
 
       const intersect =
@@ -858,7 +1187,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     baseBeams: Beam[]
   ) {
     const keptPillars = basePillars.filter(
-      (p) => !pointInPolygon(poly, p.x, p.y)
+      (p) => !pointInPolygon(poly, p.x, p.y, false)
     );
     const keptIds = new Set(keptPillars.map((p) => p.id));
     const keptBeams = baseBeams.filter(
@@ -994,6 +1323,26 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return m;
   };
 
+  const computeBeamSection = (beam: Beam, span: number) => {
+    if (!beam.isSteel) {
+      return {
+        width: beam.width,
+        height: span / 10,
+        steelProfile: beam.steelProfile,
+      };
+    }
+    const profile =
+      beam.steelAuto
+        ? getSteelProfileForBeam(span, "auto")
+        : getSteelProfileByName(beam.steelProfile);
+    const resolved = profile ?? getSteelProfileForBeam(span, "auto");
+    return {
+      width: resolved ? resolved.bf : beam.width,
+      height: resolved ? resolved.d : span / 12,
+      steelProfile: resolved?.name ?? beam.steelProfile,
+    };
+  };
+
   const refreshBeamsFromAnchors = (beamList: Beam[], pillarList: Pillar[]) => {
     const map = buildPillarMap(pillarList);
     const next: Beam[] = [];
@@ -1006,8 +1355,17 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const x2 = c.x;
       const y2 = c.y;
       const span = Math.hypot(x2 - x1, y2 - y1);
-      const height = span / 10;
-      next.push({ ...b, x1, y1, x2, y2, height });
+      const section = computeBeamSection(b, span);
+      next.push({
+        ...b,
+        x1,
+        y1,
+        x2,
+        y2,
+        width: section.width,
+        height: section.height,
+        steelProfile: section.steelProfile,
+      });
     });
     return next;
   };
@@ -1054,8 +1412,11 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const span = Math.hypot(dx, dy);
     if (span === 0) return { pillars: working, beams: baseBeams };
 
-    const width = 0.15;
-    const height = span / 10;
+    const steelProfile = beamIsSteel
+      ? getSteelProfileForBeam(span, beamSteelProfile)
+      : null;
+    const width = steelProfile ? steelProfile.bf : 0.15;
+    const height = steelProfile ? steelProfile.d : beamIsSteel ? span / 12 : span / 10;
     const id = Date.now() + Math.random();
 
     const newBeam: Beam = {
@@ -1070,6 +1431,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       y2: b.y,
       width,
       height,
+      isSteel: beamIsSteel,
+      steelProfile: steelProfile?.name,
+      steelAuto: beamSteelProfile === "auto",
     };
 
     const exists = baseBeams.some(
@@ -1086,12 +1450,36 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
   const buildBeamBetweenPillars = (
     a: Pillar,
     b: Pillar,
-    width = 0.15
+    width = 0.15,
+    template?: Beam
   ): Beam | null => {
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const span = Math.hypot(dx, dy);
     if (span === 0) return null;
+    const useSteel = template ? !!template.isSteel : beamIsSteel;
+    const steelChoice = template
+      ? template.steelAuto ||
+        !template.steelProfile ||
+        template.steelProfile === "auto"
+        ? "auto"
+        : template.steelProfile
+      : beamSteelProfile;
+    const steelAuto =
+      template
+        ? template.steelAuto ||
+          !template.steelProfile ||
+          template.steelProfile === "auto"
+        : beamSteelProfile === "auto";
+    const steelProfile = useSteel
+      ? getSteelProfileForBeam(span, steelChoice)
+      : null;
+    const beamWidth = steelProfile ? steelProfile.bf : width;
+    const beamHeight = steelProfile
+      ? steelProfile.d
+      : useSteel
+        ? span / 12
+        : span / 10;
     return {
       id: Date.now() + Math.random(),
       startId: a.id,
@@ -1102,8 +1490,11 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       y1: a.y,
       x2: b.x,
       y2: b.y,
-      width,
-      height: span / 10,
+      width: beamWidth,
+      height: beamHeight,
+      isSteel: useSteel,
+      steelProfile: steelProfile?.name,
+      steelAuto,
     };
   };
 
@@ -1337,8 +1728,8 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const startP = map.get(beam.startId);
     const endP = map.get(beam.endId);
     if (!startP || !endP) return beamList;
-    const beamA = buildBeamBetweenPillars(startP, anchor, beam.width);
-    const beamB = buildBeamBetweenPillars(anchor, endP, beam.width);
+    const beamA = buildBeamBetweenPillars(startP, anchor, beam.width, beam);
+    const beamB = buildBeamBetweenPillars(anchor, endP, beam.width, beam);
     if (!beamA || !beamB) return beamList;
     return beamList.filter((b) => b.id !== beam.id).concat([beamA, beamB]);
   };
@@ -1419,13 +1810,16 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const dx = newEnd.x - newStart.x;
     const dy = newEnd.y - newStart.y;
     const span = Math.hypot(dx, dy);
+    const section = computeBeamSection(nextSource, span);
     nextSource = {
       ...nextSource,
       x1: newStart.x,
       y1: newStart.y,
       x2: newEnd.x,
       y2: newEnd.y,
-      height: span / 10,
+      width: section.width,
+      height: section.height,
+      steelProfile: section.steelProfile,
       originStartId: nextSource.startId,
       originEndId: nextSource.endId,
     };
@@ -1525,23 +1919,13 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
           (bb.startId === b.id && bb.endId === a.id)
       );
       if (exists) return;
-      const span = Math.hypot(b.x - a.x, b.y - a.y);
-      if (span < 1e-6) return;
-      const width = 0.15;
-      const height = span / 10;
-      curBeams.push({
-        id: Date.now() + Math.random(),
-        startId: a.id,
-        endId: b.id,
-        originStartId: a.id,
-        originEndId: b.id,
-        x1: a.x,
-        y1: a.y,
-        x2: b.x,
-        y2: b.y,
-        width,
-        height,
-      });
+      const axisTol = 1e-4;
+      const aligned =
+        Math.abs(a.x - b.x) <= axisTol || Math.abs(a.y - b.y) <= axisTol;
+      if (!aligned) return;
+      const newBeam = buildBeamBetweenPillars(a, b);
+      if (!newBeam) return;
+      curBeams.push(newBeam);
     };
 
     ysMerged.forEach((y) => {
@@ -1574,10 +1958,157 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       }
     });
 
+    if (gridMode === "contour") {
+      const tol = 1e-4;
+      const isInList = (val: number, list: number[]) =>
+        list.some((v) => Math.abs(v - val) <= tol);
+      const nearestInList = (val: number, list: number[]) =>
+        list.reduce((best, v) =>
+          Math.abs(v - val) < Math.abs(best - val) ? v : best
+        );
+      const segmentInside = (a: Point3, b: Point3) => {
+        const steps = 4;
+        for (let i = 1; i < steps; i++) {
+          const t = i / steps;
+          const x = a.x + (b.x - a.x) * t;
+          const y = a.y + (b.y - a.y) * t;
+          if (!pointInPolygon(poly, x, y)) return false;
+        }
+        return true;
+      };
+      const ensurePillarAt = (x: number, y: number) => {
+        const found = curPillars.find(
+          (p) => isVisiblePillar(p) && Math.hypot(p.x - x, p.y - y) <= gridTol
+        );
+        if (found) {
+          if (isAutoLike(found)) {
+            found.kind = "pre";
+            found.homeX = found.x;
+            found.homeY = found.y;
+          }
+          return found;
+        }
+        const created = addPillarDirect(x, y, "pre");
+        curPillars.push(created);
+        return created;
+      };
+      const addBeamBetweenPillars = (a: Pillar, b: Pillar) => {
+        const exists = curBeams.some(
+          (bb) =>
+            (bb.startId === a.id && bb.endId === b.id) ||
+            (bb.startId === b.id && bb.endId === a.id)
+        );
+        if (exists) return;
+        const newBeam = buildBeamBetweenPillars(a, b);
+        if (!newBeam) return;
+        curBeams.push(newBeam);
+      };
+
+      const diagonalBeams = baseBeams.filter(
+        (b) =>
+          Math.abs(b.x1 - b.x2) > tol && Math.abs(b.y1 - b.y2) > tol
+      );
+      if (diagonalBeams.length > 0) {
+        const diagonalPillars = curPillars.filter(
+          (p) =>
+            isVisiblePillar(p) &&
+            diagonalBeams.some((b) => isPillarOnBeam(p, b, 0.02, 0.02))
+        );
+        diagonalPillars.forEach((p) => {
+          const hasX = isInList(p.x, xsMerged);
+          const hasY = isInList(p.y, ysMerged);
+          if (hasX && hasY) return;
+
+          const nearestX = nearestInList(p.x, xsMerged);
+          const nearestY = nearestInList(p.y, ysMerged);
+          const horiz = { x: nearestX, y: p.y, z: 0 };
+          const vert = { x: p.x, y: nearestY, z: 0 };
+          const hDist = Math.abs(nearestX - p.x);
+          const vDist = Math.abs(nearestY - p.y);
+
+          const tryConnect = (target: Point3) => {
+            if (!segmentInside({ x: p.x, y: p.y, z: 0 }, target)) return false;
+            const targetPillar = ensurePillarAt(target.x, target.y);
+            addBeamBetweenPillars(p, targetPillar);
+            return true;
+          };
+
+          if (hasX && !hasY) {
+            tryConnect(vert);
+            return;
+          }
+          if (hasY && !hasX) {
+            tryConnect(horiz);
+            return;
+          }
+          if (hDist <= vDist) {
+            if (!tryConnect(horiz)) {
+              tryConnect(vert);
+            }
+          } else {
+            if (!tryConnect(vert)) {
+              tryConnect(horiz);
+            }
+          }
+        });
+      }
+    }
+
     const enforced = enforceAutoPillars(curPillars, curBeams);
     const refreshed = refreshBeamsFromAnchors(curBeams, enforced);
-    setPillars(enforced);
-    setBeams(refreshed);
+
+    const dedupeByPosition = (pillarsIn: Pillar[], beamsIn: Beam[]) => {
+      const key = (p: Pillar) => `${p.x.toFixed(4)}|${p.y.toFixed(4)}`;
+      const pickWinner = (a: Pillar, b: Pillar) => {
+        const score = (p: Pillar) => {
+          let s = 0;
+          if (!p.hidden) s += 8;
+          if (isPillarActive(p)) s += 4;
+          if (p.kind === "pre") s += 3;
+          else if (p.kind === "auto") s += 2;
+          else if (p.kind === "temp") s += 1;
+          return s;
+        };
+        return score(b) > score(a) ? b : a;
+      };
+      const chosenByKey = new Map<string, Pillar>();
+      const remap = new Map<number, number>();
+      pillarsIn.forEach((p) => {
+        const k = key(p);
+        const existing = chosenByKey.get(k);
+        if (!existing) {
+          chosenByKey.set(k, p);
+          return;
+        }
+        const winner = pickWinner(existing, p);
+        const loser = winner === existing ? p : existing;
+        chosenByKey.set(k, winner);
+        remap.set(loser.id, winner.id);
+      });
+      const nextPillars = Array.from(chosenByKey.values());
+      const nextBeams = beamsIn.map((b) => {
+        const startId = remap.get(b.startId) ?? b.startId;
+        const endId = remap.get(b.endId) ?? b.endId;
+        const originStartId = remap.get(b.originStartId ?? b.startId) ?? (b.originStartId ?? b.startId);
+        const originEndId = remap.get(b.originEndId ?? b.endId) ?? (b.originEndId ?? b.endId);
+        return { ...b, startId, endId, originStartId, originEndId };
+      });
+      const seen = new Set<string>();
+      const uniqueBeams: Beam[] = [];
+      nextBeams.forEach((b) => {
+        const a = Math.min(b.startId, b.endId);
+        const c = Math.max(b.startId, b.endId);
+        const k = `${a}|${c}`;
+        if (seen.has(k)) return;
+        seen.add(k);
+        uniqueBeams.push(b);
+      });
+      return { pillars: nextPillars, beams: uniqueBeams };
+    };
+
+    const deduped = dedupeByPosition(enforced, refreshed);
+    setPillars(deduped.pillars);
+    setBeams(deduped.beams);
   };
 
   const addPillarAt = (x: number, y: number) => {
@@ -1619,6 +2150,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     if (kind === "pre") {
       base.homeX = x;
       base.homeY = y;
+    }
+    if (pillarIsSteel && kind !== "anchor") {
+      const profile = getSteelProfileForPillar(pillarSteelProfile);
+      if (profile) {
+        base.isSteel = true;
+        base.steelProfile = profile.name;
+        base.steelAuto = pillarSteelProfile === "auto";
+      }
     }
     if (pillarType === "retangular") {
       base.width = pillarWidth;
@@ -1664,7 +2203,17 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
     const ensureAutoAt = (x: number, y: number) => {
       const found = findAt(x, y);
-      if (found) return found.id;
+      if (found) {
+        if (pillarIsSteel && isAutoLike(found) && !found.isSteel) {
+          const profile = getSteelProfileForPillar(pillarSteelProfile);
+          if (profile) {
+            found.isSteel = true;
+            found.steelProfile = profile.name;
+            found.steelAuto = pillarSteelProfile === "auto";
+          }
+        }
+        return found.id;
+      }
       const created = makeAutoPillar(x, y);
       pillarsWork.push(created);
       return created.id;
@@ -1976,25 +2525,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
         const a = byId.get(aId);
         const c = byId.get(bId);
         if (!a || !c) return;
-        const dx = c.x - a.x;
-        const dy = c.y - a.y;
-        const span = Math.hypot(dx, dy);
-        if (span < 1e-6) return;
-        const width = 0.15;
-        const height = span / 10;
-        nextBeams.push({
-          id: Date.now() + Math.random(),
-          startId: aId,
-          endId: bId,
-          originStartId: aId,
-          originEndId: bId,
-          x1: a.x,
-          y1: a.y,
-          x2: c.x,
-          y2: c.y,
-          width,
-          height,
-        });
+        const newBeam = buildBeamBetweenPillars(a, c);
+        if (!newBeam) return;
+        nextBeams.push(newBeam);
         existing.add(key);
       };
 
@@ -2464,6 +2997,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
         ...original,
         state: "suspended",
         suspendedBy: cloneId,
+        hidden: true,
       };
       nextPillars.push(clone);
       nextBeams = remapBeamsForSuspension(nextBeams, original.id, cloneId);
@@ -2539,6 +3073,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const original = byId.get(originalId);
       const clone = byId.get(cloneId);
       if (!original || !clone) return;
+      original.hidden = true;
       if (fullBorderOriginals.has(originalId)) {
         if (original.state !== "suspended") {
           original.state = "suspended";
@@ -2822,47 +3357,35 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const removeIds = new Set<number>();
 
     session.cloneMap.forEach((cloneId, originalId) => {
-      const original = byId.get(originalId);
       const clone = byId.get(cloneId);
       if (!clone) return;
-
-      const discardOriginal =
-        session.fullBorderOriginals?.has(originalId) ?? false;
-      if (discardOriginal || (original && original.state === "suspended")) {
-        removeIds.add(originalId);
-        clone.kind = "pre";
-        clone.state = "active";
-        clone.moveClone = false;
-        clone.cloneOfId = undefined;
-        clone.homeX = clone.x;
-        clone.homeY = clone.y;
-        nextBeams = nextBeams.map((b) => {
-          const originStartId = b.originStartId ?? b.startId;
-          const originEndId = b.originEndId ?? b.endId;
-          let startId = b.startId;
-          let endId = b.endId;
-          const nextOriginStartId =
-            originStartId === originalId ? cloneId : originStartId;
-          const nextOriginEndId =
-            originEndId === originalId ? cloneId : originEndId;
-          if (startId === originalId) startId = cloneId;
-          if (endId === originalId) endId = cloneId;
-          return {
-            ...b,
-            startId,
-            endId,
-            originStartId: nextOriginStartId,
-            originEndId: nextOriginEndId,
-          };
-        });
-      } else {
-        clone.kind = "pre";
-        clone.state = "active";
-        clone.moveClone = false;
-        clone.cloneOfId = undefined;
-        clone.homeX = clone.x;
-        clone.homeY = clone.y;
-      }
+      removeIds.add(originalId);
+      clone.kind = "pre";
+      clone.state = "active";
+      clone.moveClone = false;
+      clone.cloneOfId = undefined;
+      clone.hidden = false;
+      clone.homeX = clone.x;
+      clone.homeY = clone.y;
+      nextBeams = nextBeams.map((b) => {
+        const originStartId = b.originStartId ?? b.startId;
+        const originEndId = b.originEndId ?? b.endId;
+        let startId = b.startId;
+        let endId = b.endId;
+        const nextOriginStartId =
+          originStartId === originalId ? cloneId : originStartId;
+        const nextOriginEndId =
+          originEndId === originalId ? cloneId : originEndId;
+        if (startId === originalId) startId = cloneId;
+        if (endId === originalId) endId = cloneId;
+        return {
+          ...b,
+          startId,
+          endId,
+          originStartId: nextOriginStartId,
+          originEndId: nextOriginEndId,
+        };
+      });
     });
 
     if (removeIds.size > 0) {
@@ -3110,6 +3633,8 @@ const clearAllPillars = () => {
 
 const applyBeamEdits = () => {
   if (selectedBeamId == null) return;
+  const target = beams.find((b) => b.id === selectedBeamId);
+  if (target?.isSteel) return;
   setBeams((prev) =>
     prev.map((b) =>
       b.id === selectedBeamId
@@ -3144,10 +3669,6 @@ const handlePillarClick = (id: number) => {
       return;
     }
     const last = points[points.length - 1];
-    const aligned =
-      Math.abs(anchor.x - last.x) < 1e-6 ||
-      Math.abs(anchor.y - last.y) < 1e-6;
-    if (!aligned) return;
     if (Math.hypot(anchor.x - last.x, anchor.y - last.y) < 1e-6) return;
     let curP = [...pillars];
     let curB = [...beams];
@@ -3599,7 +4120,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
 
     const ux = dx / len;
     const uy = dy / len;
-    const tolPerp = 0.05; // tolerância transversal (m)
+    const tolPerp = 0.05; // toler ncia transversal (m)
     const margin = 0.05; // margem longitudinal (m)
 
     const candidates = pillars
@@ -3607,7 +4128,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
       .map((p) => {
         const vx = p.x - x1;
         const vy = p.y - y1;
-        const t = vx * ux + vy * uy; // projeção ao longo da viga
+        const t = vx * ux + vy * uy; // proje  o ao longo da viga
         const perp = Math.abs(vx * -uy + vy * ux); // dist. perpendicular
         return { p, t, perp };
       })
@@ -3634,6 +4155,21 @@ const handlePlaneClick = (p: Point3, e?: any) => {
   const splitBeamIntoSegments = (beam: Beam): BeamSegment[] => {
     const data = getBeamAlignedPillars(beam);
     if (!data || data.points.length < 2) {
+      const steelSection = beam.isSteel
+        ? (() => {
+            const span = Math.hypot(beam.x2 - beam.x1, beam.y2 - beam.y1);
+            const profile =
+              beam.steelAuto || !beam.steelProfile || beam.steelProfile === "auto"
+                ? getSteelProfileForBeam(span, "auto")
+                : getSteelProfileByName(beam.steelProfile);
+            const resolved = profile ?? getSteelProfileForBeam(span, "auto");
+            return {
+              width: resolved ? resolved.bf : beam.width,
+              height: resolved ? resolved.d : span / 12,
+              steelProfile: resolved?.name ?? beam.steelProfile,
+            };
+          })()
+        : null;
       return [
         {
           id: `${beam.id}-0`,
@@ -3642,8 +4178,11 @@ const handlePlaneClick = (p: Point3, e?: any) => {
           y1: beam.y1,
           x2: beam.x2,
           y2: beam.y2,
-          width: beam.width,
-          height: beam.height,
+          width: steelSection ? steelSection.width : beam.width,
+          height: steelSection ? steelSection.height : beam.height,
+          isSteel: beam.isSteel,
+          steelProfile: steelSection?.steelProfile ?? beam.steelProfile,
+          steelAuto: beam.steelAuto,
         },
       ];
     }
@@ -3658,7 +4197,21 @@ const handlePlaneClick = (p: Point3, e?: any) => {
       if (t2 - t1 < 1e-4) continue;
 
       const segLen = t2 - t1;
-      const segHeight = segLen / 10; // regra h = vão/10 aplicada ao trecho
+      const steelSection = beam.isSteel
+        ? (() => {
+            const profile =
+              beam.steelAuto || !beam.steelProfile || beam.steelProfile === "auto"
+                ? getSteelProfileForBeam(segLen, "auto")
+                : getSteelProfileByName(beam.steelProfile);
+            const resolved = profile ?? getSteelProfileForBeam(segLen, "auto");
+            return {
+              width: resolved ? resolved.bf : beam.width,
+              height: resolved ? resolved.d : segLen / 12,
+              steelProfile: resolved?.name ?? beam.steelProfile,
+            };
+          })()
+        : null;
+      const segHeight = steelSection ? steelSection.height : segLen / 10; // aÃ§o usa d do perfil
 
       const seg: BeamSegment = {
         id: `${beam.id}-${i}`,
@@ -3667,8 +4220,11 @@ const handlePlaneClick = (p: Point3, e?: any) => {
         y1: beam.y1 + (beam.y2 - beam.y1) * (t1 / len),
         x2: beam.x1 + (beam.x2 - beam.x1) * (t2 / len),
         y2: beam.y1 + (beam.y2 - beam.y1) * (t2 / len),
-        width: beam.width,
+        width: steelSection ? steelSection.width : beam.width,
         height: segHeight,
+        isSteel: beam.isSteel,
+        steelProfile: steelSection?.steelProfile ?? beam.steelProfile,
+        steelAuto: beam.steelAuto,
       };
       segments.push(seg);
     }
@@ -3683,11 +4239,15 @@ const handlePlaneClick = (p: Point3, e?: any) => {
           x2: beam.x2,
           y2: beam.y2,
           width: beam.width,
-          height:
-            Math.sqrt(
-              (beam.x2 - beam.x1) * (beam.x2 - beam.x1) +
-                (beam.y2 - beam.y1) * (beam.y2 - beam.y1)
-            ) / 10,
+          height: beam.isSteel
+            ? beam.height
+            : Math.sqrt(
+                (beam.x2 - beam.x1) * (beam.x2 - beam.x1) +
+                  (beam.y2 - beam.y1) * (beam.y2 - beam.y1)
+              ) / 10,
+          isSteel: beam.isSteel,
+          steelProfile: beam.steelProfile,
+          steelAuto: beam.steelAuto,
         },
       ];
     }
@@ -3730,6 +4290,30 @@ const handlePlaneClick = (p: Point3, e?: any) => {
         spanPillars,
       };
     })();
+  const selectedBeamProfileName =
+    selectedBeamSegment && selectedBeamSegment.isSteel
+      ? selectedBeamSegment.steelProfile ??
+        (selectedBeamSegment.steelAuto
+          ? getSteelProfileForBeam(beamInfo?.span ?? 0, "auto")?.name ?? "auto"
+          : null)
+      : selectedBeam && selectedBeam.isSteel
+        ? selectedBeam.steelAuto ||
+          !selectedBeam.steelProfile ||
+          selectedBeam.steelProfile === "auto"
+          ? getSteelProfileForBeam(beamInfo?.span ?? 0, "auto")?.name ?? "auto"
+          : getSteelProfileByName(selectedBeam.steelProfile)?.name ??
+            selectedBeam.steelProfile
+        : null;
+  const selectedPillarProfileName =
+    selectedPillar && selectedPillar.isSteel
+      ? selectedPillar.steelAuto ||
+        !selectedPillar.steelProfile ||
+        selectedPillar.steelProfile === "auto"
+        ? getSteelProfileForPillar("auto")?.name ?? "auto"
+        : getSteelProfileByName(selectedPillar.steelProfile)?.name ??
+          selectedPillar.steelProfile
+      : null;
+  const selectedBeamIsSteel = !!selectedBeam?.isSteel;
 
   const selectionRect =
     moveMode && moveSelection.start && moveSelection.current
@@ -3788,7 +4372,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
           <span style={{ marginLeft: 8 }}>Painel</span>
         </div>
 
-        {/* SEÇÃO PDF */}
+        {/* SE  O PDF */}
         <div
           style={{
             marginBottom: 8,
@@ -3832,7 +4416,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
 
               {loading && (
                 <div style={{ fontSize: 12, marginBottom: 8 }}>
-                  Carregando PDF…
+                  Carregando PDF 
                 </div>
               )}
 
@@ -3902,7 +4486,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                 </div>
               </div>
 
-              {/* medição */}
+              {/* medi  o */}
               <div style={{ marginBottom: 8 }}>
                 <button
                   onClick={() => {
@@ -3930,7 +4514,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                 >
                   {measureMode
                     ? "?? Medindo (clique em 2 pontos)"
-                    : "?? Medir distância"}
+                    : "?? Medir dist ncia"}
                 </button>
 
                 <button
@@ -3946,7 +4530,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     fontSize: 12,
                   }}
                 >
-                  Limpar medição
+                  Limpar medi  o
                 </button>
               </div>
 
@@ -3973,7 +4557,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
           )}
         </div>
 
-       {/* SEÇÃO ELEMENTOS (PILARES + VIGAS) */}
+       {/* SE  O ELEMENTOS (PILARES + VIGAS) */}
         <div
           style={{
             marginBottom: 8,
@@ -4007,27 +4591,26 @@ const handlePlaneClick = (p: Point3, e?: any) => {
             >
               {/* ---------- PILARES ---------- */}
               <div style={{ marginBottom: 10, fontSize: 13 }}>
-                <div style={{ marginBottom: 4, opacity: 0.8 }}>Tipo de pilar:</div>
-                <label style={{ display: "block" }}>
-                  <input
-                    type="radio"
-                    name="tipoPilar"
-                    value="retangular"
-                    checked={pillarType === "retangular"}
-                    onChange={() => setPillarType("retangular")}
-                  />{" "}
-                  Retangular
-                </label>
-                <label style={{ display: "block" }}>
-                  <input
-                    type="radio"
-                    name="tipoPilar"
-                    value="circular"
-                    checked={pillarType === "circular"}
-                    onChange={() => setPillarType("circular")}
-                  />{" "}
-                  Circular
-                </label>
+                <div style={{ marginBottom: 4, opacity: 0.8 }}>Tipo do pilar:</div>
+                <select
+                  value={pillarMaterial}
+                  onChange={(e) =>
+                    setPillarMaterial(e.target.value as MaterialType)
+                  }
+                  style={{
+                    width: "100%",
+                    background: "#111",
+                    color: "#fff",
+                    border: "1px solid #333",
+                    borderRadius: 4,
+                    padding: "4px 6px",
+                    marginTop: 4,
+                    fontSize: 12,
+                  }}
+                >
+                  <option value="concreto">Concreto</option>
+                  <option value="metalico">Metalico</option>
+                </select>
               </div>
 
               <div style={{ marginBottom: 10 }}>
@@ -4048,73 +4631,105 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                 />
               </div>
 
-              {pillarType === "retangular" && (
-                <div style={{ marginBottom: 10, fontSize: 13 }}>
-                  <div style={{ marginBottom: 4, opacity: 0.8 }}>
-                    Dimensões (m):
+              {pillarMaterial === "concreto" && (
+                <>
+                  <div style={{ marginBottom: 10, fontSize: 13 }}>
+                    <div style={{ marginBottom: 4, opacity: 0.8 }}>
+                      Tipo de se  o:
+                    </div>
+                    <label style={{ display: "block" }}>
+                      <input
+                        type="radio"
+                        name="tipoPilar"
+                        value="retangular"
+                        checked={pillarType === "retangular"}
+                        onChange={() => setPillarType("retangular")}
+                      />{" "}
+                      Retangular
+                    </label>
+                    <label style={{ display: "block" }}>
+                      <input
+                        type="radio"
+                        name="tipoPilar"
+                        value="circular"
+                        checked={pillarType === "circular"}
+                        onChange={() => setPillarType("circular")}
+                      />{" "}
+                      Circular
+                    </label>
                   </div>
-                  <div style={{ marginBottom: 4 }}>
-                    Largura:
-                    <input
-                      type="number"
-                      value={pillarWidth}
-                      onChange={(e) => setPillarWidth(Number(e.target.value))}
-                      style={{
-                        width: "100%",
-                        background: "#111",
-                        color: "#fff",
-                        border: "1px solid #333",
-                        borderRadius: 4,
-                        padding: "2px 4px",
-                        marginTop: 2,
-                      }}
-                    />
-                  </div>
-                  <div>
-                    Comprimento:
-                    <input
-                      type="number"
-                      value={pillarLength}
-                      onChange={(e) => setPillarLength(Number(e.target.value))}
-                      style={{
-                        width: "100%",
-                        background: "#111",
-                        color: "#fff",
-                        border: "1px solid #333",
-                        borderRadius: 4,
-                        padding: "2px 4px",
-                        marginTop: 2,
-                      }}
-                    />
-                  </div>
-                </div>
-              )}
 
-              {pillarType === "circular" && (
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 12, opacity: 0.8 }}>Diâmetro (m):</div>
-                  <input
-                    type="number"
-                    value={pillarDiameter}
-                    onChange={(e) =>
-                      setPillarDiameter(Number(e.target.value))
-                    }
-                    style={{
-                      width: "100%",
-                      background: "#111",
-                      color: "#fff",
-                      border: "1px solid #333",
-                      borderRadius: 4,
-                      padding: "2px 4px",
-                      marginTop: 4,
-                    }}
-                  />
-                </div>
+                  {pillarType === "retangular" && (
+                    <div style={{ marginBottom: 10, fontSize: 13 }}>
+                      <div style={{ marginBottom: 4, opacity: 0.8 }}>
+                        Dimens es (m):
+                      </div>
+                      <div style={{ marginBottom: 4 }}>
+                        Largura:
+                        <input
+                          type="number"
+                          value={pillarWidth}
+                          onChange={(e) => setPillarWidth(Number(e.target.value))}
+                          style={{
+                            width: "100%",
+                            background: "#111",
+                            color: "#fff",
+                            border: "1px solid #333",
+                            borderRadius: 4,
+                            padding: "2px 4px",
+                            marginTop: 2,
+                          }}
+                        />
+                      </div>
+                      <div>
+                        Comprimento:
+                        <input
+                          type="number"
+                          value={pillarLength}
+                          onChange={(e) => setPillarLength(Number(e.target.value))}
+                          style={{
+                            width: "100%",
+                            background: "#111",
+                            color: "#fff",
+                            border: "1px solid #333",
+                            borderRadius: 4,
+                            padding: "2px 4px",
+                            marginTop: 2,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {pillarType === "circular" && (
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ fontSize: 12, opacity: 0.8 }}>
+                        Di metro (m):
+                      </div>
+                      <input
+                        type="number"
+                        value={pillarDiameter}
+                        onChange={(e) =>
+                          setPillarDiameter(Number(e.target.value))
+                        }
+                        style={{
+                          width: "100%",
+                          background: "#111",
+                          color: "#fff",
+                          border: "1px solid #333",
+                          borderRadius: 4,
+                          padding: "2px 4px",
+                          marginTop: 4,
+                        }}
+                      />
+                    </div>
+                  )}
+                </>
               )}
 
               <div style={{ marginBottom: 10, fontSize: 13 }}>
                 <div style={{ marginBottom: 4, opacity: 0.8 }}>
-                  Alinhamento dos próximos pilares:
+                  Alinhamento dos pr ximos pilares:
                 </div>
                 <label style={{ display: "block" }}>
                   <input
@@ -4134,7 +4749,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     checked={alignMode === "horizontal"}
                     onChange={() => setAlignMode("horizontal")}
                   />{" "}
-                  Horizontal (mesmo Y do último)
+                  Horizontal (mesmo Y do  ltimo)
                 </label>
                 <label style={{ display: "block" }}>
                   <input
@@ -4144,9 +4759,38 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     checked={alignMode === "vertical"}
                     onChange={() => setAlignMode("vertical")}
                   />{" "}
-                  Vertical (mesmo X do último)
+                  Vertical (mesmo X do  ltimo)
                 </label>
               </div>
+
+              {pillarMaterial === "metalico" && (
+                <div style={{ marginBottom: 10, fontSize: 13 }}>
+                  <div style={{ marginBottom: 4, opacity: 0.8 }}>
+                    Perfil met lico:
+                  </div>
+                  <select
+                    value={pillarSteelProfile}
+                    onChange={(e) => setPillarSteelProfile(e.target.value)}
+                    style={{
+                      width: "100%",
+                      marginTop: 4,
+                      background: "#111",
+                      color: "#fff",
+                      border: "1px solid #333",
+                      borderRadius: 4,
+                      padding: "4px 6px",
+                      fontSize: 12,
+                    }}
+                  >
+                    <option value="auto">Auto (menor massa)</option>
+                    {STEEL_PROFILES.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               <button
                 onClick={() => {
@@ -4224,11 +4868,11 @@ const handlePlaneClick = (p: Point3, e?: any) => {
 
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ fontSize: 12, opacity: 0.8 }}>
-                    Vão máximo entre pilares:
+                    V o m ximo entre pilares:
                   </div>
                   <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 11 }}>Direção X (m):</div>
+                      <div style={{ fontSize: 11 }}>Dire  o X (m):</div>
                       <input
                         type="number"
                         step="0.1"
@@ -4246,7 +4890,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                       />
                     </div>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 11 }}>Direção Y (m):</div>
+                      <div style={{ fontSize: 11 }}>Dire  o Y (m):</div>
                       <input
                         type="number"
                         step="0.1"
@@ -4302,6 +4946,51 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                       Travar Y
                     </label>
                   </div>
+                </div>
+
+                <div style={{ marginBottom: 8, fontSize: 12 }}>
+                  <div style={{ marginBottom: 4, opacity: 0.8 }}>Tipo da viga:</div>
+                  <select
+                    value={beamMaterial}
+                    onChange={(e) =>
+                      setBeamMaterial(e.target.value as MaterialType)
+                    }
+                    style={{
+                      width: "100%",
+                      background: "#111",
+                      color: "#fff",
+                      border: "1px solid #333",
+                      borderRadius: 4,
+                      padding: "4px 6px",
+                      fontSize: 12,
+                    }}
+                  >
+                    <option value="concreto">Concreto (L/10)</option>
+                    <option value="metalico">Metalico (L/12)</option>
+                  </select>
+                  {beamMaterial === "metalico" && (
+                    <select
+                      value={beamSteelProfile}
+                      onChange={(e) => setBeamSteelProfile(e.target.value)}
+                      style={{
+                        width: "100%",
+                        marginTop: 6,
+                        background: "#111",
+                        color: "#fff",
+                        border: "1px solid #333",
+                        borderRadius: 4,
+                        padding: "4px 6px",
+                        fontSize: 12,
+                      }}
+                    >
+                      <option value="auto">Auto (menor massa / d â‰¥ L/12)</option>
+                      {STEEL_PROFILES.map((p) => (
+                        <option key={p.name} value={p.name}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
 
                 <button
@@ -4383,8 +5072,8 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                   }}
                 >
                   {drawRectBeamMode
-                    ? "Clique em 2 cantos para criar retângulo de vigas"
-                    : "? Retângulo de vigas (perímetro)"}
+                    ? "Clique em 2 cantos para criar ret ngulo de vigas"
+                    : "? Ret ngulo de vigas (per metro)"}
                 </button>
 
                 <button
@@ -4419,7 +5108,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                   }}
                 >
                   {drawPolylineMode
-                    ? "Clique nos vértices da polilinha de vigas"
+                    ? "Clique nos v rtices da polilinha de vigas"
                     : "?? Polilinha de vigas"}
                 </button>
                 <button
@@ -4521,7 +5210,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                   <div
                     style={{ fontSize: 11, opacity: 0.8, marginBottom: 6 }}
                   >
-                    Primeiro canto do retângulo definido. Clique no canto oposto.
+                    Primeiro canto do ret ngulo definido. Clique no canto oposto.
                   </div>
                 )}
 
@@ -4568,6 +5257,11 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     <div style={{ marginBottom: 6, opacity: 0.85 }}>
                       Editar viga selecionada:
                     </div>
+                    {selectedBeamIsSteel && (
+                      <div style={{ fontSize: 11, opacity: 0.75, marginBottom: 6 }}>
+                        Perfil met lico definido pela tabela.
+                      </div>
+                    )}
 
                     <div style={{ marginBottom: 6 }}>
                       <span style={{ fontSize: 12 }}>Largura (m): </span>
@@ -4578,9 +5272,10 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                         onChange={(e) =>
                           setEditBeamWidth(Number(e.target.value))
                         }
+                        disabled={selectedBeamIsSteel}
                         style={{
                           width: "100%",
-                          background: "#111",
+                          background: selectedBeamIsSteel ? "#333" : "#111",
                           color: "#fff",
                           border: "1px solid #333",
                           borderRadius: 4,
@@ -4599,9 +5294,10 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                         onChange={(e) =>
                           setEditBeamHeight(Number(e.target.value))
                         }
+                        disabled={selectedBeamIsSteel}
                         style={{
                           width: "100%",
-                          background: "#111",
+                          background: selectedBeamIsSteel ? "#333" : "#111",
                           color: "#fff",
                           border: "1px solid #333",
                           borderRadius: 4,
@@ -4613,18 +5309,19 @@ const handlePlaneClick = (p: Point3, e?: any) => {
 
                     <button
                       onClick={applyBeamEdits}
+                      disabled={selectedBeamIsSteel}
                       style={{
                         width: "100%",
                         padding: 6,
                         borderRadius: 4,
                         border: "none",
-                        cursor: "pointer",
-                        background: "#00aa66",
+                        cursor: selectedBeamIsSteel ? "not-allowed" : "pointer",
+                        background: selectedBeamIsSteel ? "#444" : "#00aa66",
                         color: "#fff",
                         fontSize: 12,
                       }}
                     >
-                      Aplicar alterações na viga
+                      Aplicar altera  es na viga
                     </button>
                   </div>
                 )}
@@ -4634,7 +5331,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
           )}
         </div>
 
-        {/* SE€ÇO MODIFICAR */}
+        {/* SE  O MODIFICAR */}
         <div
           style={{
             marginBottom: 8,
@@ -5056,7 +5753,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
             />
           )}
 
-          {/* CUBO DE VISTAS – versão que funcionou */}
+          {/* CUBO DE VISTAS   vers o que funcionou */}
           <GizmoHelper alignment="bottom-right" margin={[60, 60]}>
             <group scale={[40, 40, 40]}>
               <ambientLight intensity={1.2} />
@@ -5113,6 +5810,9 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                 </div>
                 <div>Tipo: {selectedPillar.type}</div>
                 <div>Altura: {selectedPillar.height?.toFixed(2)} m</div>
+                {selectedPillar.isSteel && (
+                  <div>Perfil: {selectedPillarProfileName}</div>
+                )}
                 {selectedPillar.type === "retangular" ? (
                   <>
                     <div>Largura: {selectedPillar.width?.toFixed(2)} m</div>
@@ -5149,6 +5849,9 @@ const handlePlaneClick = (p: Point3, e?: any) => {
 
                 </div>
 
+                {selectedBeam.isSteel && (
+                  <div>Perfil: {selectedBeamProfileName}</div>
+                )}
                 <div>Comprimento: {beamInfo.span.toFixed(3)} m</div>
 
                 {beamInfo.spanPillars && (
