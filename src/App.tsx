@@ -5,6 +5,7 @@ import {
   Line,
   Html,
   GizmoHelper,
+  Edges,
   PerspectiveCamera,
   OrthographicCamera,
   Text,
@@ -350,6 +351,24 @@ const buildIShape = (profile: SteelProfile) => {
   shape.lineTo(-halfBF, halfD - tf);
   shape.closePath();
   return shape;
+};
+
+const getFilletMidpoints = (profile: SteelProfile) => {
+  const { d, tf, tw, r } = profile;
+  if (!isFinite(r) || r <= 0) return [];
+  const halfD = d / 2;
+  const halfTW = tw / 2;
+  const offset = r / Math.SQRT2;
+  const cxRight = halfTW + r;
+  const cxLeft = -halfTW - r;
+  const cyTop = halfD - tf - r;
+  const cyBottom = -halfD + tf + r;
+  return [
+    { x: cxRight - offset, y: cyTop + offset },
+    { x: cxLeft + offset, y: cyTop + offset },
+    { x: cxRight - offset, y: cyBottom - offset },
+    { x: cxLeft + offset, y: cyBottom - offset },
+  ];
 };
 
 const isPillarActive = (p: Pillar) => p.state !== "suspended";
@@ -712,6 +731,7 @@ function BeamMesh({
 
   if (isSteel && steelProfile) {
     const shape = buildIShape(steelProfile);
+    const filletPoints = getFilletMidpoints(steelProfile);
     return (
       <mesh
         position={[midX, midY, centerZ]}
@@ -740,6 +760,19 @@ function BeamMesh({
           }}
         />
         <meshStandardMaterial color={color} />
+        <Edges color="#111" />
+        {filletPoints.map((pt, idx) => (
+          <Line
+            key={`fillet-${idx}`}
+            points={[
+              [-span / 2, pt.x, pt.y],
+              [span / 2, pt.x, pt.y],
+            ]}
+            color="#111"
+            lineWidth={1}
+            raycast={(_r: any, _i: any) => null}
+          />
+        ))}
       </mesh>
     );
   }
@@ -803,6 +836,7 @@ function PillarMesh({
 
   if (isSteel && steelProfile) {
     const shape = buildIShape(steelProfile);
+    const filletPoints = getFilletMidpoints(steelProfile);
     return (
       <mesh
         position={[x, y, centerZ]}
@@ -840,6 +874,19 @@ function PillarMesh({
           }}
         />
         <meshStandardMaterial color={color} />
+        <Edges color="#111" />
+        {filletPoints.map((pt, idx) => (
+          <Line
+            key={`pillar-fillet-${idx}`}
+            points={[
+              [pt.x, pt.y, -h / 2],
+              [pt.x, pt.y, h / 2],
+            ]}
+            color="#111"
+            lineWidth={1}
+            raycast={(_r: any, _i: any) => null}
+          />
+        ))}
       </mesh>
     );
   }
