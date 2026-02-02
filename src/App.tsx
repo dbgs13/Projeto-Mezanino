@@ -27,7 +27,7 @@ type Point3 = { x: number; y: number; z: number };
 
 type PillarKind = "pre" | "auto" | "temp" | "anchor";
 type PillarState = "active" | "suspended";
-type AnchorRole = "free" | "support";
+type AnchorRole = "free" | "support" | "secondary";
 
 type SteelProfile = {
   name: string;
@@ -40,6 +40,7 @@ type SteelProfile = {
 };
 
 type MaterialType = "concreto" | "metalico";
+type BeamRole = "primary" | "secondary";
 
 type Pillar = {
   id: number;
@@ -78,6 +79,7 @@ type Beam = {
   isSteel?: boolean;
   steelProfile?: string;
   steelAuto?: boolean;
+  role?: BeamRole;
 };
 
 type BeamSegment = {
@@ -92,6 +94,7 @@ type BeamSegment = {
   isSteel?: boolean;
   steelProfile?: string;
   steelAuto?: boolean;
+  role?: BeamRole;
 };
 
 type MoveSelection = {
@@ -297,9 +300,9 @@ const STEEL_PROFILES = parseSteelProfiles(STEEL_PROFILE_DATA);
 const getSteelProfileByName = (name?: string) =>
   STEEL_PROFILES.find((p) => p.name === name) ?? null;
 
-const selectSteelProfile = (spanM: number): SteelProfile | null => {
+const selectSteelProfile = (spanM: number, ratio = 12): SteelProfile | null => {
   if (!STEEL_PROFILES.length) return null;
-  const required = spanM / 12;
+  const required = spanM / ratio;
   const candidates = STEEL_PROFILES.filter((p) => p.d >= required);
   if (candidates.length > 0) {
     return candidates.reduce((best, cur) =>
@@ -311,11 +314,15 @@ const selectSteelProfile = (spanM: number): SteelProfile | null => {
   return biggest.reduce((best, cur) => (cur.mass < best.mass ? cur : best));
 };
 
-const getSteelProfileForBeam = (spanM: number, choice: string) => {
+const getSteelProfileForBeam = (
+  spanM: number,
+  choice: string,
+  ratio = 12
+) => {
   if (choice && choice !== "auto") {
-    return getSteelProfileByName(choice) ?? selectSteelProfile(spanM);
+    return getSteelProfileByName(choice) ?? selectSteelProfile(spanM, ratio);
   }
-  return selectSteelProfile(spanM);
+  return selectSteelProfile(spanM, ratio);
 };
 
 const getSteelProfileForPillar = (choice: string) => {
@@ -725,6 +732,8 @@ function BeamMesh({
     ? "#22cc88"
     : isSupportSource
       ? "#ff8844"
+      : beam.role === "secondary"
+        ? "#ffd200"
       : isSelected
         ? "#ffcc00"
         : "#8888ff";
@@ -990,10 +999,20 @@ function App() {
     point: Point3;
     pillarId: number;
   } | null>(null);
+  const [beamChainStartId, setBeamChainStartId] = useState<number | null>(null);
+  const [beamChainPoints, setBeamChainPoints] = useState<Point3[]>([]);
   const [beamHoverPillarId, setBeamHoverPillarId] = useState<number | null>(null);
   const [beamCantileverMode, setBeamCantileverMode] = useState(false);
   const [beamMaterial, setBeamMaterial] = useState<MaterialType>("concreto");
   const [beamSteelProfile, setBeamSteelProfile] = useState<string>("auto");
+  const [secondaryEnabled, setSecondaryEnabled] = useState(false);
+  const [deckSpan, setDeckSpan] = useState(4);
+  const [secondaryMaterial, setSecondaryMaterial] =
+    useState<MaterialType>("metalico");
+  const [secondarySteelProfile, setSecondarySteelProfile] =
+    useState<string>("auto");
+  const [slabs, setSlabs] = useState<Point3[][]>([]);
+  const primaryBeamsKeyRef = useRef<string>("");
   const [supportBeamMode, setSupportBeamMode] = useState(false);
   const [supportSourceBeamId, setSupportSourceBeamId] = useState<number | null>(null);
   const [supportTargetBeamId, setSupportTargetBeamId] = useState<number | null>(null);
@@ -1061,6 +1080,7 @@ function App() {
     if (points.length >= 3) {
       const polyPoints =
         dist <= 1e-6 ? closedPoints.slice(0, -1) : closedPoints;
+      registerSlab(polyPoints);
       const filtered = filterOutsidePolygon(polyPoints, curP, curB);
       generateGridInsidePolygon(
         polyPoints,
@@ -1084,6 +1104,282 @@ function App() {
     setPolyPreviewPoint(null);
     setPolyHoverPillarId(null);
     cleanupOrphanBeams();
+  };
+
+  const resetBeamChain = () => {
+    setBeamChainStartId(null);
+    setBeamChainPoints([]);
+  };
+
+  const registerSlab = (poly: Point3[]) => {
+    if (poly.length < 3) return;
+    const norm = poly.map((p) => ({
+      x: Math.round(p.x * 1000) / 1000,
+      y: Math.round(p.y * 1000) / 1000,
+      z: 0,
+    }));
+    setSlabs((prev) => [...prev, norm]);
+  };
+
+  const stripSecondaryArtifacts = (pillarList: Pillar[], beamList: Beam[]) => {
+    const keptPillars = pillarList.filter(
+      (p) => !(p.hidden && p.kind === "anchor" && p.anchorRole === "secondary")
+    );
+    const keptIds = new Set(keptPillars.map((p) => p.id));
+    const keptBeams = beamList.filter(
+      (b) =>
+        b.role !== "secondary" &&
+        keptIds.has(b.startId) &&
+        keptIds.has(b.endId)
+    );
+    return { pillars: keptPillars, beams: keptBeams };
+  };
+
+  const rebuildSecondaryBeams = (
+    pillarList: Pillar[],
+    beamList: Beam[],
+    slabList: Point3[][]
+  ) => {
+    const base = stripSecondaryArtifacts(pillarList, beamList);
+    if (!secondaryEnabled || deckSpan <= 0 || slabList.length === 0) {
+      return base;
+    }
+    let curP = [...base.pillars];
+    let curB = [...base.beams];
+    slabList.forEach((poly) => {
+      const bounds = {
+        minX: Math.min(...poly.map((p) => p.x)),
+        maxX: Math.max(...poly.map((p) => p.x)),
+        minY: Math.min(...poly.map((p) => p.y)),
+        maxY: Math.max(...poly.map((p) => p.y)),
+      };
+      const lines = collectPrimaryLinesFromBeams(poly, curB);
+      const res = appendSecondaryBeamsWithLines(
+        poly,
+        curP,
+        curB,
+        lines.xs,
+        lines.ys,
+        bounds
+      );
+      curP = res.pillars;
+      curB = res.beams;
+    });
+    const refreshed = refreshBeamsFromAnchors(curB, curP);
+    return { pillars: curP, beams: refreshed };
+  };
+
+  const recalcSecondaryFromCurrent = (
+    pillarList: Pillar[] = pillars,
+    beamList: Beam[] = beams
+  ) => {
+    const base = stripSecondaryArtifacts(pillarList, beamList);
+    const derivedSlabs = recomputeSlabsFromBeams(base.pillars, base.beams);
+    setSlabs(derivedSlabs);
+    if (!secondaryEnabled || deckSpan <= 0) {
+      setPillars(base.pillars);
+      setBeams(base.beams);
+      return;
+    }
+    const rebuilt = rebuildSecondaryBeams(
+      base.pillars,
+      base.beams,
+      derivedSlabs
+    );
+    setPillars(rebuilt.pillars);
+    setBeams(rebuilt.beams);
+  };
+
+  const getPrimaryBeamsKey = (beamList: Beam[]) =>
+    beamList
+      .filter((b) => b.role !== "secondary")
+      .map(
+        (b) =>
+          `${Math.min(b.startId, b.endId)}|${Math.max(b.startId, b.endId)}|${b.x1.toFixed(3)}|${b.y1.toFixed(3)}|${b.x2.toFixed(3)}|${b.y2.toFixed(3)}`
+      )
+      .sort()
+      .join(";");
+
+  const coversRange = (segments: Array<[number, number]>, min: number, max: number, tol = 1e-4) => {
+    if (segments.length === 0) return false;
+    const sorted = segments
+      .map(([a, b]) => (a <= b ? [a, b] : [b, a]) as [number, number])
+      .sort((a, b) => a[0] - b[0]);
+    let curStart = sorted[0][0];
+    let curEnd = sorted[0][1];
+    for (let i = 1; i < sorted.length; i++) {
+      const [s, e] = sorted[i];
+      if (s <= curEnd + tol) {
+        curEnd = Math.max(curEnd, e);
+      } else {
+        if (curStart <= min + tol && curEnd >= max - tol) return true;
+        curStart = s;
+        curEnd = e;
+      }
+    }
+    return curStart <= min + tol && curEnd >= max - tol;
+  };
+
+  const recomputeSlabsFromBeams = (
+    pillarList: Pillar[],
+    beamList: Beam[]
+  ): Point3[][] => {
+    const primaryBeams = beamList.filter((b) => b.role !== "secondary");
+    if (primaryBeams.length === 0) return [];
+    const quant = (v: number) => Math.round(v * 1000) / 1000;
+    const axisTol = 1e-3;
+    const beamsByPillar = new Map<number, Beam[]>();
+    primaryBeams.forEach((b) => {
+      const a = b.startId;
+      const c = b.endId;
+      if (!beamsByPillar.has(a)) beamsByPillar.set(a, []);
+      if (!beamsByPillar.has(c)) beamsByPillar.set(c, []);
+      beamsByPillar.get(a)!.push(b);
+      beamsByPillar.get(c)!.push(b);
+    });
+
+    const visited = new Set<number>();
+    const slabsOut: Point3[][] = [];
+    const tol = 1e-4;
+
+    primaryBeams.forEach((b) => {
+      if (visited.has(b.id)) return;
+      const queue = [b];
+      const compBeams: Beam[] = [];
+      visited.add(b.id);
+      while (queue.length) {
+        const cur = queue.pop()!;
+        compBeams.push(cur);
+        const nextPillars = [cur.startId, cur.endId];
+        nextPillars.forEach((pid) => {
+          const list = beamsByPillar.get(pid) ?? [];
+          list.forEach((nb) => {
+            if (visited.has(nb.id)) return;
+            visited.add(nb.id);
+            queue.push(nb);
+          });
+        });
+      }
+
+      const axisBeams = compBeams.filter(
+        (bb) =>
+          Math.abs(bb.x1 - bb.x2) <= axisTol ||
+          Math.abs(bb.y1 - bb.y2) <= axisTol
+      );
+      if (axisBeams.length === 0) return;
+
+      const horiz = axisBeams.filter(
+        (bb) => Math.abs(bb.y1 - bb.y2) <= axisTol
+      );
+      const vert = axisBeams.filter(
+        (bb) => Math.abs(bb.x1 - bb.x2) <= axisTol
+      );
+      if (horiz.length === 0 || vert.length === 0) return;
+
+      const horizMap = new Map<number, Array<[number, number]>>();
+      horiz.forEach((bb) => {
+        const y = quant((bb.y1 + bb.y2) / 2);
+        const list = horizMap.get(y) ?? [];
+        list.push([bb.x1, bb.x2]);
+        horizMap.set(y, list);
+      });
+      const vertMap = new Map<number, Array<[number, number]>>();
+      vert.forEach((bb) => {
+        const x = quant((bb.x1 + bb.x2) / 2);
+        const list = vertMap.get(x) ?? [];
+        list.push([bb.y1, bb.y2]);
+        vertMap.set(x, list);
+      });
+
+      const yVals = uniqueSorted(Array.from(horizMap.keys()));
+      const xVals = uniqueSorted(Array.from(vertMap.keys()));
+      if (yVals.length < 2 || xVals.length < 2) return;
+
+      const yMin = yVals[0];
+      const yMax = yVals[yVals.length - 1];
+      const xMin = xVals[0];
+      const xMax = xVals[xVals.length - 1];
+
+      const xDivs: number[] = [];
+      xVals.forEach((x) => {
+        const segments = vertMap.get(x) ?? [];
+        if (coversRange(segments, yMin, yMax, axisTol)) xDivs.push(x);
+      });
+      const yDivs: number[] = [];
+      yVals.forEach((y) => {
+        const segments = horizMap.get(y) ?? [];
+        if (coversRange(segments, xMin, xMax, axisTol)) yDivs.push(y);
+      });
+
+      const xs = uniqueSorted(xDivs);
+      const ys = uniqueSorted(yDivs);
+      if (xs.length < 2 || ys.length < 2) return;
+
+      for (let i = 0; i < xs.length - 1; i++) {
+        for (let j = 0; j < ys.length - 1; j++) {
+          const a = { x: xs[i], y: ys[j], z: 0 };
+          const b2 = { x: xs[i + 1], y: ys[j], z: 0 };
+          const c2 = { x: xs[i + 1], y: ys[j + 1], z: 0 };
+          const d2 = { x: xs[i], y: ys[j + 1], z: 0 };
+          slabsOut.push([a, b2, c2, d2]);
+        }
+      }
+    });
+
+    if (slabsOut.length > 0) return slabsOut;
+
+    const tol2 = axisTol;
+    const axisBeamsAll = primaryBeams.filter(
+      (bb) =>
+        Math.abs(bb.x1 - bb.x2) <= tol2 || Math.abs(bb.y1 - bb.y2) <= tol2
+    );
+    const horizAll = axisBeamsAll.filter(
+      (bb) => Math.abs(bb.y1 - bb.y2) <= tol2
+    );
+    const vertAll = axisBeamsAll.filter(
+      (bb) => Math.abs(bb.x1 - bb.x2) <= tol2
+    );
+    if (horizAll.length === 0 || vertAll.length === 0) return slabsOut;
+    const horizAllMap = new Map<number, Array<[number, number]>>();
+    horizAll.forEach((bb) => {
+      const y = quant((bb.y1 + bb.y2) / 2);
+      const list = horizAllMap.get(y) ?? [];
+      list.push([bb.x1, bb.x2]);
+      horizAllMap.set(y, list);
+    });
+    const vertAllMap = new Map<number, Array<[number, number]>>();
+    vertAll.forEach((bb) => {
+      const x = quant((bb.x1 + bb.x2) / 2);
+      const list = vertAllMap.get(x) ?? [];
+      list.push([bb.y1, bb.y2]);
+      vertAllMap.set(x, list);
+    });
+    const yValsAll = uniqueSorted(Array.from(horizAllMap.keys()));
+    const xValsAll = uniqueSorted(Array.from(vertAllMap.keys()));
+    if (yValsAll.length < 2 || xValsAll.length < 2) return slabsOut;
+    const yMin = yValsAll[0];
+    const yMax = yValsAll[yValsAll.length - 1];
+    const xMin = xValsAll[0];
+    const xMax = xValsAll[xValsAll.length - 1];
+    const leftSegs = vertAllMap.get(xMin) ?? [];
+    const rightSegs = vertAllMap.get(xMax) ?? [];
+    const bottomSegs = horizAllMap.get(yMin) ?? [];
+    const topSegs = horizAllMap.get(yMax) ?? [];
+    if (
+      coversRange(leftSegs, yMin, yMax) &&
+      coversRange(rightSegs, yMin, yMax) &&
+      coversRange(bottomSegs, xMin, xMax) &&
+      coversRange(topSegs, xMin, xMax)
+    ) {
+      slabsOut.push([
+        { x: xMin, y: yMin, z: 0 },
+        { x: xMax, y: yMin, z: 0 },
+        { x: xMax, y: yMax, z: 0 },
+        { x: xMin, y: yMax, z: 0 },
+      ]);
+    }
+
+    return slabsOut;
   };
 
 const [selectedBeamId, setSelectedBeamId] = useState<number | null>(null);
@@ -1132,6 +1428,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
   const pillarIsSteel = pillarMaterial === "metalico";
   const beamIsSteel = beamMaterial === "metalico";
+  const secondaryIsSteel = secondaryMaterial === "metalico";
 
   const isOrtho = viewMode !== "3d";
 
@@ -1153,6 +1450,33 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       setSnapGuideY(null);
     }
   }, [drawPolylineMode]);
+
+  useEffect(() => {
+    if (!secondaryEnabled) {
+      const stripped = stripSecondaryArtifacts(pillars, beams);
+      setPillars(stripped.pillars);
+      setBeams(stripped.beams);
+      return;
+    }
+    const base = stripSecondaryArtifacts(pillars, beams);
+    const derivedSlabs = recomputeSlabsFromBeams(base.pillars, base.beams);
+    setSlabs(derivedSlabs);
+    const rebuilt = rebuildSecondaryBeams(
+      base.pillars,
+      base.beams,
+      derivedSlabs
+    );
+    setPillars(rebuilt.pillars);
+    setBeams(rebuilt.beams);
+  }, [secondaryEnabled, deckSpan, secondaryMaterial, secondarySteelProfile]);
+
+  useEffect(() => {
+    if (!secondaryEnabled) return;
+    const key = getPrimaryBeamsKey(beams);
+    if (key === primaryBeamsKeyRef.current) return;
+    primaryBeamsKeyRef.current = key;
+    recalcSecondaryFromCurrent();
+  }, [beams, secondaryEnabled]);
 
   const handleFileChange = async (event: any) => {
     const file = event.target.files?.[0];
@@ -1256,8 +1580,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       }
     });
     if (!best) return p;
-    const snapped = best as Pillar;
-    return { ...p, x: snapped.x, y: snapped.y };
+    return { ...p, x: best.x, y: best.y };
   };
 
   const computeSnapGuides = (p: Point3) => {
@@ -1370,22 +1693,26 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     return m;
   };
 
+  const getBeamDesignRatio = (beam: Beam) =>
+    beam.role === "secondary" ? 24 : beam.isSteel ? 12 : 10;
+
   const computeBeamSection = (beam: Beam, span: number) => {
+    const ratio = getBeamDesignRatio(beam);
     if (!beam.isSteel) {
       return {
         width: beam.width,
-        height: span / 10,
+        height: span / ratio,
         steelProfile: beam.steelProfile,
       };
     }
     const profile =
       beam.steelAuto
-        ? getSteelProfileForBeam(span, "auto")
+        ? getSteelProfileForBeam(span, "auto", ratio)
         : getSteelProfileByName(beam.steelProfile);
-    const resolved = profile ?? getSteelProfileForBeam(span, "auto");
+    const resolved = profile ?? getSteelProfileForBeam(span, "auto", ratio);
     return {
       width: resolved ? resolved.bf : beam.width,
-      height: resolved ? resolved.d : span / 12,
+      height: resolved ? resolved.d : span / ratio,
       steelProfile: resolved?.name ?? beam.steelProfile,
     };
   };
@@ -1459,11 +1786,12 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const span = Math.hypot(dx, dy);
     if (span === 0) return { pillars: working, beams: baseBeams };
 
+    const ratio = beamIsSteel ? 12 : 10;
     const steelProfile = beamIsSteel
-      ? getSteelProfileForBeam(span, beamSteelProfile)
+      ? getSteelProfileForBeam(span, beamSteelProfile, ratio)
       : null;
     const width = steelProfile ? steelProfile.bf : 0.15;
-    const height = steelProfile ? steelProfile.d : beamIsSteel ? span / 12 : span / 10;
+    const height = steelProfile ? steelProfile.d : span / ratio;
     const id = Date.now() + Math.random();
 
     const newBeam: Beam = {
@@ -1481,6 +1809,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       isSteel: beamIsSteel,
       steelProfile: steelProfile?.name,
       steelAuto: beamSteelProfile === "auto",
+      role: "primary",
     };
 
     const exists = baseBeams.some(
@@ -1498,12 +1827,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     a: Pillar,
     b: Pillar,
     width = 0.15,
-    template?: Beam
+    template?: Beam,
+    role: BeamRole = "primary"
   ): Beam | null => {
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const span = Math.hypot(dx, dy);
     if (span === 0) return null;
+    const beamRole = template?.role ?? role;
     const useSteel = template ? !!template.isSteel : beamIsSteel;
     const steelChoice = template
       ? template.steelAuto ||
@@ -1518,15 +1849,16 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
           !template.steelProfile ||
           template.steelProfile === "auto"
         : beamSteelProfile === "auto";
+    const ratio = beamRole === "secondary" ? 24 : useSteel ? 12 : 10;
     const steelProfile = useSteel
-      ? getSteelProfileForBeam(span, steelChoice)
+      ? getSteelProfileForBeam(span, steelChoice, ratio)
       : null;
     const beamWidth = steelProfile ? steelProfile.bf : width;
     const beamHeight = steelProfile
       ? steelProfile.d
       : useSteel
-        ? span / 12
-        : span / 10;
+        ? span / ratio
+        : span / ratio;
     return {
       id: Date.now() + Math.random(),
       startId: a.id,
@@ -1542,6 +1874,37 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       isSteel: useSteel,
       steelProfile: steelProfile?.name,
       steelAuto,
+      role: beamRole,
+    };
+  };
+
+  const buildSecondaryBeamBetweenPillars = (a: Pillar, b: Pillar): Beam | null => {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const span = Math.hypot(dx, dy);
+    if (span === 0) return null;
+    const ratio = 24;
+    const steelProfile = secondaryIsSteel
+      ? getSteelProfileForBeam(span, secondarySteelProfile, ratio)
+      : null;
+    const beamWidth = steelProfile ? steelProfile.bf : 0.15;
+    const beamHeight = steelProfile ? steelProfile.d : span / ratio;
+    return {
+      id: Date.now() + Math.random(),
+      startId: a.id,
+      endId: b.id,
+      originStartId: a.id,
+      originEndId: b.id,
+      x1: a.x,
+      y1: a.y,
+      x2: b.x,
+      y2: b.y,
+      width: beamWidth,
+      height: beamHeight,
+      isSteel: secondaryIsSteel,
+      steelProfile: steelProfile?.name,
+      steelAuto: secondarySteelProfile === "auto",
+      role: "secondary",
     };
   };
 
@@ -1570,9 +1933,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     setSelectedPillarId(null);
     setSelectedBeamSegment(null);
 
-    const snapped = snapToPillarPoint(point);
     const startPoint = beamTempStart?.point ?? null;
-    let target = snapped;
+    const guide = computeSnapGuides(point);
+    let target = snapToGuides({ x: point.x, y: point.y, z: 0 }, guide.x, guide.y);
     if (startPoint) {
       if (drawAxisLock === "x") {
         target = { ...target, x: startPoint.x };
@@ -1598,6 +1961,18 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       });
       return best;
     };
+
+    if (startPoint) {
+      const aligned = getNearestAlignedPillar(target, startPoint, 0.4, 0.05);
+      if (aligned) {
+        target = { ...target, x: aligned.x, y: aligned.y };
+      }
+    } else {
+      const nearestExact = findNearest(target, false, 0.4);
+      if (nearestExact) {
+        target = { ...target, x: nearestExact.x, y: nearestExact.y };
+      }
+    }
 
     if (!beamTempStart) {
       const existing = findNearest(target, false);
@@ -1645,8 +2020,59 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       })();
 
     const res = applyAddBeamBetweenPillars(startPillar, endPillar, curP, curB);
-    setPillars(res.pillars);
-    setBeams(res.beams);
+    let nextPillars = res.pillars;
+    let nextBeams = res.beams;
+
+    if (!endPillar.hidden) {
+      const startId = beamChainStartId ?? startPillar.id;
+      const startPoint =
+        beamChainStartId == null
+          ? { x: startPillar.x, y: startPillar.y, z: 0 }
+          : beamChainPoints[0];
+      const nextPoints =
+        beamChainStartId == null
+          ? [startPoint, { x: endPillar.x, y: endPillar.y, z: 0 }]
+          : [...beamChainPoints, { x: endPillar.x, y: endPillar.y, z: 0 }];
+
+      if (endPillar.id === startId && nextPoints.length >= 3) {
+        const poly =
+          nextPoints.length > 1 &&
+          Math.hypot(
+            nextPoints[0].x - nextPoints[nextPoints.length - 1].x,
+            nextPoints[0].y - nextPoints[nextPoints.length - 1].y
+          ) <= 1e-6
+            ? nextPoints.slice(0, -1)
+            : nextPoints;
+        registerSlab(poly);
+        const { xs, ys } = collectPrimaryLinesFromBeams(poly, nextBeams);
+        const bounds = {
+          minX: Math.min(...poly.map((p) => p.x)),
+          maxX: Math.max(...poly.map((p) => p.x)),
+          minY: Math.min(...poly.map((p) => p.y)),
+          maxY: Math.max(...poly.map((p) => p.y)),
+        };
+        const secRes = appendSecondaryBeamsWithLines(
+          poly,
+          nextPillars,
+          nextBeams,
+          xs,
+          ys,
+          bounds
+        );
+        nextPillars = secRes.pillars;
+        nextBeams = secRes.beams;
+        resetBeamChain();
+      } else {
+        setBeamChainStartId(startId);
+        setBeamChainPoints(nextPoints);
+      }
+    }
+
+    setPillars(nextPillars);
+    setBeams(nextBeams);
+    if (secondaryEnabled) {
+      recalcSecondaryFromCurrent(nextPillars, nextBeams);
+    }
     setBeamTempStart({
       point: { x: endPillar.x, y: endPillar.y, z: 0 },
       pillarId: endPillar.id,
@@ -1888,6 +2314,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     gridMode: "regular" | "contour" = "regular"
   ) => {
     if (!poly || poly.length < 3) return;
+    registerSlab(poly);
     let minX = poly[0].x;
     let maxX = poly[0].x;
     let minY = poly[0].y;
@@ -2101,6 +2528,18 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       }
     }
 
+    const primaryLines = collectPrimaryLinesFromBeams(poly, curBeams);
+    const secondaryResult = appendSecondaryBeamsWithLines(
+      poly,
+      curPillars,
+      curBeams,
+      primaryLines.xs.length ? primaryLines.xs : xsMerged,
+      primaryLines.ys.length ? primaryLines.ys : ysMerged,
+      { minX, maxX, minY, maxY }
+    );
+    curPillars = secondaryResult.pillars;
+    curBeams = secondaryResult.beams;
+
     const enforced = enforceAutoPillars(curPillars, curBeams);
     const refreshed = refreshBeamsFromAnchors(curBeams, enforced);
 
@@ -2156,6 +2595,9 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const deduped = dedupeByPosition(enforced, refreshed);
     setPillars(deduped.pillars);
     setBeams(deduped.beams);
+    if (secondaryEnabled) {
+      recalcSecondaryFromCurrent(deduped.pillars, deduped.beams);
+    }
   };
 
   const addPillarAt = (x: number, y: number) => {
@@ -2242,6 +2684,44 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     const tolPos = 0.02;
     const pillarsWork: Pillar[] = [...pillarList];
     const key = (x: number, y: number) => `${x.toFixed(4)}|${y.toFixed(4)}`;
+    const axisKey = (v: number) => (Math.round(v * 1000) / 1000).toFixed(3);
+
+    const horizAlign = new Map<string, Set<number>>();
+    const vertAlign = new Map<string, Set<number>>();
+
+    beamList.forEach((b) => {
+      if (b.role === "secondary") return;
+      const dx = b.x2 - b.x1;
+      const dy = b.y2 - b.y1;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) return;
+      const isHoriz = Math.abs(dy) <= tolPos;
+      const isVert = Math.abs(dx) <= tolPos;
+      if (!isHoriz && !isVert) return;
+      const minX = Math.min(b.x1, b.x2);
+      const maxX = Math.max(b.x1, b.x2);
+      const minY = Math.min(b.y1, b.y2);
+      const maxY = Math.max(b.y1, b.y2);
+      const mapKey = isHoriz
+        ? `h|${axisKey(minX)}|${axisKey(maxX)}`
+        : `v|${axisKey(minY)}|${axisKey(maxY)}`;
+      const targetMap = isHoriz ? horizAlign : vertAlign;
+      if (!targetMap.has(mapKey)) targetMap.set(mapKey, new Set());
+      const set = targetMap.get(mapKey)!;
+      const ux = dx / len;
+      const uy = dy / len;
+      pillarsWork.forEach((p) => {
+        if (!isPillarActive(p)) return;
+        const vx = p.x - b.x1;
+        const vy = p.y - b.y1;
+        const t = vx * ux + vy * uy;
+        if (t < -tolPos || t > len + tolPos) return;
+        const perp = Math.abs(vx * -uy + vy * ux);
+        if (perp > tolPerp) return;
+        if (isHoriz) set.add(p.x);
+        else set.add(p.y);
+      });
+    });
 
     const findAt = (x: number, y: number) =>
       pillarsWork.find(
@@ -2267,6 +2747,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     };
 
     beamList.forEach((b) => {
+      if (b.role === "secondary") return;
       const dx = b.x2 - b.x1;
       const dy = b.y2 - b.y1;
       const len = Math.hypot(dx, dy);
@@ -2281,6 +2762,36 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       if (maxSpan <= 0) return;
       const ux = dx / len;
       const uy = dy / len;
+
+      if (!isDiagonal) {
+        if (useX) {
+          const minX = Math.min(b.x1, b.x2);
+          const maxX = Math.max(b.x1, b.x2);
+          const mapKey = `h|${axisKey(minX)}|${axisKey(maxX)}`;
+          const alignedXs = horizAlign.get(mapKey);
+          if (alignedXs && alignedXs.size > 0) {
+            alignedXs.forEach((x) => {
+              const t = (x - b.x1) * ux;
+              if (t < -tolPos || t > len + tolPos) return;
+              const y = b.y1 + uy * t;
+              ensureAutoAt(x, y);
+            });
+          }
+        } else {
+          const minY = Math.min(b.y1, b.y2);
+          const maxY = Math.max(b.y1, b.y2);
+          const mapKey = `v|${axisKey(minY)}|${axisKey(maxY)}`;
+          const alignedYs = vertAlign.get(mapKey);
+          if (alignedYs && alignedYs.size > 0) {
+            alignedYs.forEach((y) => {
+              const t = (y - b.y1) * uy;
+              if (t < -tolPos || t > len + tolPos) return;
+              const x = b.x1 + ux * t;
+              ensureAutoAt(x, y);
+            });
+          }
+        }
+      }
 
       const aligned: { t: number; auto: boolean }[] = [];
       pillarsWork.forEach((p) => {
@@ -2334,6 +2845,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
     // remove autos n?o usados em nenhuma viga
     const usedKeys = new Set<string>();
     beamList.forEach((b) => {
+      if (b.role === "secondary") return;
       usedKeys.add(key(b.x1, b.y1));
       usedKeys.add(key(b.x2, b.y2));
       const dx = b.x2 - b.x1;
@@ -3381,11 +3893,14 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       expansionResult.expansionPairs
     );
 
-    setPillars(expandedPillars);
-    setBeams(refreshed);
+    const rebuilt = finalize
+      ? rebuildSecondaryBeams(expandedPillars, refreshed, slabs)
+      : { pillars: expandedPillars, beams: refreshed };
+    setPillars(rebuilt.pillars);
+    setBeams(rebuilt.beams);
     session.prevClonePositions = nextPositions;
 
-    if (finalize) {
+  if (finalize) {
       finalizeMoveSession(expandedPillars, refreshed);
     }
   };
@@ -3641,6 +4156,7 @@ const clearAllBeams = () => {
 const clearAllPillars = () => {
   isClearingRef.current = true;
   moveSessionRef.current = null;
+  setSlabs([]);
   setDrawBeamMode(false);
   setDrawRectBeamMode(false);
   setDrawPolylineMode(false);
@@ -3652,6 +4168,7 @@ const clearAllPillars = () => {
   setBeamTempStart(null);
   setRectTempStart(null);
   setPolyPoints([]);
+  resetBeamChain();
   setPolyPreviewPoint(null);
   setPolyHoverPillarId(null);
   setSnapGuideX(null);
@@ -4014,6 +4531,15 @@ const handlePlaneClick = (p: Point3, e?: any) => {
   }
 
   if (drawBeamMode) {
+    if (beamHoverPillarId != null) {
+      const hovered = pillars.find(
+        (pp) => pp.id === beamHoverPillarId && isVisiblePillar(pp)
+      );
+      if (hovered) {
+        handleBeamPointClick({ x: hovered.x, y: hovered.y, z: 0 });
+        return;
+      }
+    }
     handleBeamPointClick(p);
     return;
   }
@@ -4061,6 +4587,22 @@ const handlePlaneClick = (p: Point3, e?: any) => {
       }
     } else if (polyHoverPillarId != null) {
       setPolyHoverPillarId(null);
+    }
+
+    if (!drawPolylineMode && drawBeamMode) {
+      const guide = computeSnapGuides(p);
+      let guideX = guide.x;
+      let guideY = guide.y;
+      if (beamTempStart) {
+        if (drawAxisLock === "x") guideX = beamTempStart.point.x;
+        if (drawAxisLock === "y") guideY = beamTempStart.point.y;
+      }
+      setSnapGuideX(guideX);
+      setSnapGuideY(guideY);
+    } else if (!drawPolylineMode && (insertMode || moveMode)) {
+      const guide = computeSnapGuides(p);
+      setSnapGuideX(guide.x);
+      setSnapGuideY(guide.y);
     }
 
     if (drawBeamMode) {
@@ -4119,7 +4661,8 @@ const handlePlaneClick = (p: Point3, e?: any) => {
       polyPreviewSegment.end.y - polyPreviewSegment.start.y
     ) > 1e-6;
 
-  const showSnapGuides = drawPolylineMode;
+  const showSnapGuides =
+    drawPolylineMode || drawBeamMode || insertMode || moveMode;
   const snapGuideBounds = (() => {
     if (pdf) {
       const widthPaperMm = pdf.pageWidthPt * POINT_TO_MM;
@@ -4202,17 +4745,18 @@ const handlePlaneClick = (p: Point3, e?: any) => {
   const splitBeamIntoSegments = (beam: Beam): BeamSegment[] => {
     const data = getBeamAlignedPillars(beam);
     if (!data || data.points.length < 2) {
+      const ratio = getBeamDesignRatio(beam);
       const steelSection = beam.isSteel
         ? (() => {
             const span = Math.hypot(beam.x2 - beam.x1, beam.y2 - beam.y1);
             const profile =
               beam.steelAuto || !beam.steelProfile || beam.steelProfile === "auto"
-                ? getSteelProfileForBeam(span, "auto")
+                ? getSteelProfileForBeam(span, "auto", ratio)
                 : getSteelProfileByName(beam.steelProfile);
-            const resolved = profile ?? getSteelProfileForBeam(span, "auto");
+            const resolved = profile ?? getSteelProfileForBeam(span, "auto", ratio);
             return {
               width: resolved ? resolved.bf : beam.width,
-              height: resolved ? resolved.d : span / 12,
+              height: resolved ? resolved.d : span / ratio,
               steelProfile: resolved?.name ?? beam.steelProfile,
             };
           })()
@@ -4230,6 +4774,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
           isSteel: beam.isSteel,
           steelProfile: steelSection?.steelProfile ?? beam.steelProfile,
           steelAuto: beam.steelAuto,
+          role: beam.role,
         },
       ];
     }
@@ -4244,21 +4789,22 @@ const handlePlaneClick = (p: Point3, e?: any) => {
       if (t2 - t1 < 1e-4) continue;
 
       const segLen = t2 - t1;
+      const ratio = getBeamDesignRatio(beam);
       const steelSection = beam.isSteel
         ? (() => {
             const profile =
               beam.steelAuto || !beam.steelProfile || beam.steelProfile === "auto"
-                ? getSteelProfileForBeam(segLen, "auto")
+                ? getSteelProfileForBeam(segLen, "auto", ratio)
                 : getSteelProfileByName(beam.steelProfile);
-            const resolved = profile ?? getSteelProfileForBeam(segLen, "auto");
+            const resolved = profile ?? getSteelProfileForBeam(segLen, "auto", ratio);
             return {
               width: resolved ? resolved.bf : beam.width,
-              height: resolved ? resolved.d : segLen / 12,
+              height: resolved ? resolved.d : segLen / ratio,
               steelProfile: resolved?.name ?? beam.steelProfile,
             };
           })()
         : null;
-      const segHeight = steelSection ? steelSection.height : segLen / 10; // aço usa d do perfil
+      const segHeight = steelSection ? steelSection.height : segLen / ratio; // aço usa d do perfil
 
       const seg: BeamSegment = {
         id: `${beam.id}-${i}`,
@@ -4272,6 +4818,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
         isSteel: beam.isSteel,
         steelProfile: steelSection?.steelProfile ?? beam.steelProfile,
         steelAuto: beam.steelAuto,
+        role: beam.role,
       };
       segments.push(seg);
     }
@@ -4291,10 +4838,11 @@ const handlePlaneClick = (p: Point3, e?: any) => {
             : Math.sqrt(
                 (beam.x2 - beam.x1) * (beam.x2 - beam.x1) +
                   (beam.y2 - beam.y1) * (beam.y2 - beam.y1)
-              ) / 10,
+              ) / getBeamDesignRatio(beam),
           isSteel: beam.isSteel,
           steelProfile: beam.steelProfile,
           steelAuto: beam.steelAuto,
+          role: beam.role,
         },
       ];
     }
@@ -4337,19 +4885,203 @@ const handlePlaneClick = (p: Point3, e?: any) => {
         spanPillars,
       };
     })();
+
+  const resolveSteelProfileName = (
+    beamLike: {
+      isSteel?: boolean;
+      steelAuto?: boolean;
+      steelProfile?: string;
+      role?: BeamRole;
+    } | null,
+    span: number
+  ) => {
+    if (!beamLike?.isSteel) return null;
+    const ratio = beamLike.role === "secondary" ? 24 : 12;
+    const choice =
+      beamLike.steelAuto ||
+      !beamLike.steelProfile ||
+      beamLike.steelProfile === "auto"
+        ? "auto"
+        : beamLike.steelProfile;
+    const resolved =
+      choice === "auto"
+        ? getSteelProfileForBeam(span, "auto", ratio)
+        : getSteelProfileByName(beamLike.steelProfile) ??
+          getSteelProfileForBeam(span, "auto", ratio);
+    return resolved?.name ?? beamLike.steelProfile ?? "auto";
+  };
+
+  const uniqueSorted = (values: number[], tol = 1e-4) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const out: number[] = [];
+    sorted.forEach((v) => {
+      if (out.length === 0 || Math.abs(v - out[out.length - 1]) > tol) {
+        out.push(v);
+      }
+    });
+    return out;
+  };
+
+  const medianSpacing = (values: number[]) => {
+    if (values.length < 2) return null;
+    const diffs: number[] = [];
+    for (let i = 0; i < values.length - 1; i++) {
+      const d = values[i + 1] - values[i];
+      if (d > 1e-6) diffs.push(d);
+    }
+    if (diffs.length === 0) return null;
+    diffs.sort((a, b) => a - b);
+    return diffs[Math.floor(diffs.length / 2)];
+  };
+
+  const pickSecondaryAxis = (spanX: number | null, spanY: number | null) => {
+    if (!secondaryEnabled || deckSpan <= 0) return null;
+    const score = (span: number | null) => {
+      if (!span) return { rem: Infinity, span: Infinity };
+      const mod = Math.abs(span % deckSpan);
+      const rem = Math.min(mod, Math.abs(deckSpan - mod));
+      return { rem, span };
+    };
+    const sx = score(spanX);
+    const sy = score(spanY);
+    if (sx.rem < sy.rem) return "y";
+    if (sy.rem < sx.rem) return "x";
+    if (sx.span < sy.span) return "y";
+    if (sy.span < sx.span) return "x";
+    return spanX != null ? "y" : spanY != null ? "x" : null;
+  };
+
+  const appendSecondaryBeamsWithLines = (
+    poly: Point3[],
+    basePillars: Pillar[],
+    baseBeams: Beam[],
+    xsLines: number[],
+    ysLines: number[],
+    bounds: { minX: number; maxX: number; minY: number; maxY: number }
+  ) => {
+    if (!secondaryEnabled || deckSpan <= 0) {
+      return { pillars: basePillars, beams: baseBeams };
+    }
+
+    const xs = uniqueSorted(xsLines);
+    const ys = uniqueSorted(ysLines);
+    if (xs.length < 2 || ys.length < 2) {
+      return { pillars: basePillars, beams: baseBeams };
+    }
+
+    const spanX = medianSpacing(xs);
+    const spanY = medianSpacing(ys);
+    const secondaryAxis = pickSecondaryAxis(spanX, spanY);
+    if (!secondaryAxis) return { pillars: basePillars, beams: baseBeams };
+
+    let curPillars = [...basePillars];
+    let curBeams = [...baseBeams];
+
+    const lineTol = 1e-4;
+    const gridTol = 0.02;
+    const segmentInside = (a: Point3, b: Point3) => {
+      const steps = 4;
+      for (let i = 1; i < steps; i++) {
+        const t = i / steps;
+        const x = a.x + (b.x - a.x) * t;
+        const y = a.y + (b.y - a.y) * t;
+        if (!pointInPolygon(poly, x, y)) return false;
+      }
+      return true;
+    };
+
+    const ensureAnchorAt = (x: number, y: number) => {
+      const foundVisible = curPillars.find(
+        (p) => isVisiblePillar(p) && Math.hypot(p.x - x, p.y - y) <= gridTol
+      );
+      if (foundVisible) return foundVisible;
+      const existingAnchor = curPillars.find(
+        (p) =>
+          p.hidden &&
+          p.kind === "anchor" &&
+          Math.hypot(p.x - x, p.y - y) <= gridTol
+      );
+      if (existingAnchor) return existingAnchor;
+      const created = buildAnchorPillar(x, y, "secondary");
+      curPillars.push(created);
+      return created;
+    };
+
+    const addSecondaryBeam = (a: Pillar, b: Pillar) => {
+      const exists = curBeams.some(
+        (bb) =>
+          (bb.startId === a.id && bb.endId === b.id) ||
+          (bb.startId === b.id && bb.endId === a.id)
+      );
+      if (exists) return;
+      const newBeam = buildSecondaryBeamBetweenPillars(a, b);
+      if (!newBeam) return;
+      curBeams.push(newBeam);
+    };
+
+    if (secondaryAxis === "y") {
+      const primaryX = xs;
+      const positions = buildGridPositions(bounds.minX, bounds.maxX, deckSpan)
+        .filter((v) => !primaryX.some((p) => Math.abs(p - v) <= lineTol));
+      positions.forEach((x) => {
+        for (let i = 0; i < ys.length - 1; i++) {
+          const y1 = ys[i];
+          const y2 = ys[i + 1];
+          const a = { x, y: y1, z: 0 };
+          const b = { x, y: y2, z: 0 };
+          const mid = { x, y: (y1 + y2) / 2, z: 0 };
+          if (!pointInPolygon(poly, mid.x, mid.y)) continue;
+          if (!segmentInside(a, b)) continue;
+          const pa = ensureAnchorAt(a.x, a.y);
+          const pb = ensureAnchorAt(b.x, b.y);
+          addSecondaryBeam(pa, pb);
+        }
+      });
+    } else {
+      const primaryY = ys;
+      const positions = buildGridPositions(bounds.minY, bounds.maxY, deckSpan)
+        .filter((v) => !primaryY.some((p) => Math.abs(p - v) <= lineTol));
+      positions.forEach((y) => {
+        for (let i = 0; i < xs.length - 1; i++) {
+          const x1 = xs[i];
+          const x2 = xs[i + 1];
+          const a = { x: x1, y, z: 0 };
+          const b = { x: x2, y, z: 0 };
+          const mid = { x: (x1 + x2) / 2, y, z: 0 };
+          if (!pointInPolygon(poly, mid.x, mid.y)) continue;
+          if (!segmentInside(a, b)) continue;
+          const pa = ensureAnchorAt(a.x, a.y);
+          const pb = ensureAnchorAt(b.x, b.y);
+          addSecondaryBeam(pa, pb);
+        }
+      });
+    }
+
+    return { pillars: curPillars, beams: curBeams };
+  };
+
+  const collectPrimaryLinesFromBeams = (poly: Point3[], beamList: Beam[]) => {
+    const tol = 1e-4;
+    const xs: number[] = [];
+    const ys: number[] = [];
+    beamList.forEach((b) => {
+      if (b.role === "secondary") return;
+      const mx = (b.x1 + b.x2) / 2;
+      const my = (b.y1 + b.y2) / 2;
+      if (!pointInPolygon(poly, mx, my)) return;
+      if (Math.abs(b.x1 - b.x2) <= tol) xs.push(b.x1);
+      if (Math.abs(b.y1 - b.y2) <= tol) ys.push(b.y1);
+    });
+    const mergedXs = uniqueSorted(xs.concat(poly.map((p) => p.x)));
+    const mergedYs = uniqueSorted(ys.concat(poly.map((p) => p.y)));
+    return { xs: mergedXs, ys: mergedYs };
+  };
+
   const selectedBeamProfileName =
     selectedBeamSegment && selectedBeamSegment.isSteel
-      ? selectedBeamSegment.steelProfile ??
-        (selectedBeamSegment.steelAuto
-          ? getSteelProfileForBeam(beamInfo?.span ?? 0, "auto")?.name ?? "auto"
-          : null)
-      : selectedBeam && selectedBeam.isSteel
-        ? selectedBeam.steelAuto ||
-          !selectedBeam.steelProfile ||
-          selectedBeam.steelProfile === "auto"
-          ? getSteelProfileForBeam(beamInfo?.span ?? 0, "auto")?.name ?? "auto"
-          : getSteelProfileByName(selectedBeam.steelProfile)?.name ??
-            selectedBeam.steelProfile
+      ? resolveSteelProfileName(selectedBeamSegment, beamInfo?.span ?? 0)
+      : selectedBeam
+        ? resolveSteelProfileName(selectedBeam, beamInfo?.span ?? 0)
         : null;
   const selectedPillarProfileName =
     selectedPillar && selectedPillar.isSteel
@@ -5040,6 +5772,102 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                   )}
                 </div>
 
+                <div style={{ marginBottom: 8, fontSize: 12 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <input
+                      type="checkbox"
+                      checked={secondaryEnabled}
+                      onChange={(e) => {
+                        const next = e.target.checked;
+                        setSecondaryEnabled(next);
+                        if (next) {
+                          recalcSecondaryFromCurrent();
+                        } else {
+                          const stripped = stripSecondaryArtifacts(pillars, beams);
+                          setPillars(stripped.pillars);
+                          setBeams(stripped.beams);
+                        }
+                      }}
+                    />
+                    Gerar vigas secundarias (L/24)
+                  </label>
+                  {secondaryEnabled && (
+                    <>
+                      <div style={{ marginTop: 6 }}>
+                        <div style={{ fontSize: 11, opacity: 0.8 }}>
+                          Vao do steel deck (m):
+                        </div>
+                        <input
+                          type="number"
+                          step="0.1"
+                          value={deckSpan}
+                          onChange={(e) => setDeckSpan(Number(e.target.value))}
+                          style={{
+                            width: "100%",
+                            background: "#111",
+                            color: "#fff",
+                            border: "1px solid #333",
+                            borderRadius: 4,
+                            padding: "2px 4px",
+                            marginTop: 2,
+                          }}
+                        />
+                      </div>
+                      <div style={{ marginTop: 6 }}>
+                        <div style={{ fontSize: 11, opacity: 0.8 }}>
+                          Tipo da secundaria:
+                        </div>
+                        <select
+                          value={secondaryMaterial}
+                          onChange={(e) =>
+                            setSecondaryMaterial(e.target.value as MaterialType)
+                          }
+                          style={{
+                            width: "100%",
+                            background: "#111",
+                            color: "#fff",
+                            border: "1px solid #333",
+                            borderRadius: 4,
+                            padding: "4px 6px",
+                            fontSize: 12,
+                            marginTop: 2,
+                          }}
+                        >
+                          <option value="concreto">Concreto (L/24)</option>
+                          <option value="metalico">Metalico (L/24)</option>
+                        </select>
+                        {secondaryMaterial === "metalico" && (
+                          <select
+                            value={secondarySteelProfile}
+                            onChange={(e) =>
+                              setSecondarySteelProfile(e.target.value)
+                            }
+                            style={{
+                              width: "100%",
+                              marginTop: 6,
+                              background: "#111",
+                              color: "#fff",
+                              border: "1px solid #333",
+                              borderRadius: 4,
+                              padding: "4px 6px",
+                              fontSize: 12,
+                            }}
+                          >
+                            <option value="auto">
+                              Auto (menor massa / d ≥ L/24)
+                            </option>
+                            {STEEL_PROFILES.map((p) => (
+                              <option key={p.name} value={p.name}>
+                                {p.name}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+
                 <button
                   onClick={() => {
                     const novo = !drawBeamMode;
@@ -5053,6 +5881,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     setBeamTempStart(null);
                     setRectTempStart(null);
                     setPolyPoints([]);
+                    resetBeamChain();
                     setInsertMode(false);
                     setMeasureMode(false);
                     setDeleteMode(false);
@@ -5100,6 +5929,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     setBeamTempStart(null);
                     setRectTempStart(null);
                     setPolyPoints([]);
+                    resetBeamChain();
                     setInsertMode(false);
                     setMeasureMode(false);
                     setDeleteMode(false);
@@ -5136,6 +5966,7 @@ const handlePlaneClick = (p: Point3, e?: any) => {
                     setBeamTempStart(null);
                     setRectTempStart(null);
                     setPolyPoints([]);
+                    resetBeamChain();
                     setInsertMode(false);
                     setMeasureMode(false);
                     setDeleteMode(false);
@@ -5896,6 +6727,9 @@ const handlePlaneClick = (p: Point3, e?: any) => {
 
                 </div>
 
+                <div>
+                  Tipo: {selectedBeam.role === "secondary" ? "Secundaria" : "Principal"}
+                </div>
                 {selectedBeam.isSteel && (
                   <div>Perfil: {selectedBeamProfileName}</div>
                 )}
