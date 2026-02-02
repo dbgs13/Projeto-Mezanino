@@ -1221,7 +1221,7 @@ function App() {
   };
 
   const recomputeSlabsFromBeams = (
-    pillarList: Pillar[],
+    _pillarList: Pillar[],
     beamList: Beam[]
   ): Point3[][] => {
     const primaryBeams = beamList.filter((b) => b.role !== "secondary");
@@ -1240,8 +1240,6 @@ function App() {
 
     const visited = new Set<number>();
     const slabsOut: Point3[][] = [];
-    const tol = 1e-4;
-
     primaryBeams.forEach((b) => {
       if (visited.has(b.id)) return;
       const queue = [b];
@@ -1580,10 +1578,13 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       }
     });
     if (!best) return p;
-    return { ...p, x: best.x, y: best.y };
+    const snapped = best as Pillar;
+    return { ...p, x: snapped.x, y: snapped.y };
   };
 
-  const computeSnapGuides = (p: Point3) => {
+  const computeSnapGuides = (
+    p: Point3
+  ): { x: number | null; y: number | null } => {
     const active = pillars.filter(isVisiblePillar);
     if (active.length === 0) {
       return { x: null, y: null };
