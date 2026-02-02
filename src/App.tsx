@@ -2712,7 +2712,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const ux = dx / len;
       const uy = dy / len;
       pillarsWork.forEach((p) => {
-        if (!isPillarActive(p)) return;
+        if (!isVisiblePillar(p)) return;
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
@@ -2726,7 +2726,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
     const findAt = (x: number, y: number) =>
       pillarsWork.find(
-        (p) => isPillarActive(p) && Math.hypot(p.x - x, p.y - y) <= tolPos
+        (p) => isVisiblePillar(p) && Math.hypot(p.x - x, p.y - y) <= tolPos
       );
 
     const ensureAutoAt = (x: number, y: number) => {
@@ -2796,7 +2796,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
 
       const aligned: { t: number; auto: boolean }[] = [];
       pillarsWork.forEach((p) => {
-        if (!isPillarActive(p)) return;
+        if (!isVisiblePillar(p)) return;
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
@@ -2856,7 +2856,7 @@ const [activePanel, setActivePanel] = useState<"pdf" | "pillars" | "modify">(
       const ux = dx / len;
       const uy = dy / len;
       pillarsWork.forEach((p) => {
-        if (!isPillarActive(p)) return;
+        if (!isVisiblePillar(p)) return;
         const vx = p.x - b.x1;
         const vy = p.y - b.y1;
         const t = vx * ux + vy * uy;
